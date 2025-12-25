@@ -4,6 +4,13 @@
 
 Я подготовил полный анализ и рабочий код для построения графа вызовов функций на уровне репозитория с поддержкой **source-sink tracking**.
 
+
+```
+docker run --rm \
+  -v /path/to/your/local/repo:/repo \
+  -v $(pwd):/out \
+  callgraph-analyzer --repo /repo --language python --output /out/call_graph.json
+```
 ### Что ты получишь:
 
 1. **Архитектура** (call_graph_architecture.md) - детальное объяснение подхода
