@@ -11,6 +11,24 @@ docker run --rm \
   -v $(pwd):/out \
   callgraph-analyzer --repo /repo --language python --output /out/call_graph.json
 ```
+
+```
+python3 call_graph_starter.py --repo ./flask --output call_graph.json
+
+Get Function Info:
+python3 call_graph_starter.py --load call_graph.json --info flask.app.Flask.run
+
+Trace Forward:
+python3 call_graph_starter.py --load call_graph.json --trace-forward flask.app.Flask.run --depth 2
+
+Trace Backward:
+python3 call_graph_starter.py --load call_graph.json --trace-backward flask.app.Flask.run
+```
+Trace all entry points:
+python3 call_graph_starter.py --repo ./VAmPI --output call_graph.json --trace-all --depth 5
+Trace all entry points (Universal): python3 call_graph_starter.py --repo ./path/to/project --output call_graph.json --trace-all --depth 5
+Find paths between two functions:
+python3 call_graph_starter.py --load call_graph.json --find-path api_views.users.me api_views.users.token_validator
 ### Что ты получишь:
 
 1. **Архитектура** (call_graph_architecture.md) - детальное объяснение подхода

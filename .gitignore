@@ -1,1 +1,5 @@
 flask
+fastapi
+VAmPI
+*.png
+*.json

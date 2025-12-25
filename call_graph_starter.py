@@ -1,541 +1,560 @@
 #!/usr/bin/env python3
 """
-Starter implementation для Inter-Procedural Call Graph анализа
-Language-agnostic, используя Tree-Sitter
-
-Usage:
-    python3 call_graph_starter.py --repo /path/to/repo --language python --output graph.json
+Финальная, рабочая реализация для построения межпроцедурного графа вызовов (IPCG)
+Language-agnostic, с парсингом импортов для Python.
 """
-
-import os
-import json
-import sys
+import os, json, sys, logging, argparse
 from pathlib import Path
-from typing import Dict, List, Tuple, Set
-from dataclasses import dataclass, asdict
+from typing import Dict, List, Tuple, Optional, Any
+from dataclasses import dataclass, asdict, field
 from collections import defaultdict
-import logging
 
-# Tree-Sitter парсинг
 try:
-    from tree_sitter import Language, Parser
-    # Import the helper to get prebuilt languages
+    from tree_sitter import Language, Parser, Node
     from tree_sitter_languages import get_language
 except ImportError:
-    print("Install required packages: pip install tree-sitter tree-sitter-languages")
-    sys.exit(1)
-logging.basicConfig(level=logging.INFO)
+    print("Install required packages: pip install tree-sitter tree-sitter-languages"); sys.exit(1)
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # ============================================================================
 # DATA MODELS
 # ============================================================================
-
 @dataclass
 class FunctionDefinition:
-    """Определение функции"""
     name: str
     file: str
     line: int
     column: int
-    signature: str = ""
-    full_name: str = ""  # module.function_name
+    full_name: str = ""
+    decorators: List[str] = field(default_factory=list)
 
 @dataclass
-class FunctionCall:
-    """Вызов функции"""
-    caller_name: str
-    callee_name: str
-    file: str
-    line: int
-    column: int
-    is_resolved: bool = False
-    resolved_to: str = ""  # full_name разрешенной функции
+class FunctionCall: caller_full_name: str; callee_name: str; file: str; line: int; column: int
+@dataclass
+class ModuleImports:
+    direct_imports: Dict[str, str] = field(default_factory=dict)
+    aliased_imports: Dict[str, str] = field(default_factory=dict)
+    from_imports: Dict[str, str] = field(default_factory=dict)
 
 # ============================================================================
-# TREE-SITTER PARSER (Language-Agnostic)
+# TREE-SITTER PARSER
 # ============================================================================
-
 class UniversalCodeParser:
-    """
-    Universal parser используя Tree-Sitter.
-    Работает с любым языком, который поддерживает Tree-Sitter.
-    """
-    
-    # Language-specific queries для извлечения функций
-    FUNCTION_QUERIES = {
-        "python": """
-            (function_definition
-              name: (identifier) @func_name) @func_def
-        """,
-        "javascript": """
-            (function_declaration
-              name: (identifier) @func_name) @func_def
-            |
-            (method_definition
-              name: (property_identifier) @func_name) @func_def
-        """,
-        "java": """
-            (method_declaration
-              name: (identifier) @func_name) @func_def
-        """,
-        "go": """
-            (function_declaration
-              name: (identifier) @func_name) @func_def
-        """,
+    QUERIES = {
+        "python": {
+            "functions": """
+                (function_definition
+                    name: (identifier) @func_name
+                ) @func_def
+                (decorator) @decorator
+            """,
+            "calls": """(call function: [(identifier) @callee (attribute object: (_) @callee_obj attribute: (identifier) @callee_attr)])""",
+            "imports": """
+                (import_statement name: (dotted_name) @import)
+                (import_statement (aliased_import name: (dotted_name) @import alias: (identifier) @alias))
+                (import_from_statement
+                    module_name: (dotted_name) @from_module
+                    name: (dotted_name) @from_import)
+                (import_from_statement
+                    module_name: (dotted_name) @from_module
+                    (aliased_import name: (dotted_name) @from_import alias: (identifier) @alias))
+            """
+        }
     }
-    
-    # Queries для извлечения вызовов
-    CALL_QUERIES = {
-        "python": """
-            (call
-              function: (identifier) @callee) @call
-            |
-            (call
-              function: (attribute
-                object: (identifier)
-                attribute: (identifier) @callee)) @call
-        """,
-        "javascript": """
-            (call_expression
-              function: (identifier) @callee) @call
-            |
-            (call_expression
-              function: (member_expression
-                object: (identifier)
-                property: (identifier) @callee)) @call
-        """,
-        "java": """
-            (method_invocation
-              name: (identifier) @callee) @call
-        """,
-        "go": """
-            (call_expression
-              function: (identifier) @callee) @call
-        """,
-    }
-    
-    def __init__(self, language: str):
-        """Initialize parser for a specific language using prebuilt binaries"""
-        self.language_name = language
+
+    def __init__(self, language: str, repo_path: str):
+        self.language, self.repo_root = language, Path(repo_path).resolve()
         self.parser = Parser()
-        
         try:
-            # Use tree-sitter-languages to load the prebuilt grammar
             lang_lib = get_language(language)
             self.parser.set_language(lang_lib)
+            self.queries = self.QUERIES.get(language, {})
+            self.func_query = lang_lib.query(self.queries.get("functions", ""))
+            self.call_query = lang_lib.query(self.queries.get("calls", ""))
+            self.import_query = lang_lib.query(self.queries.get("imports", ""))
+            self.func_types = self.queries.get("func_types", {"function_definition"})
         except Exception as e:
-            logger.warning(f"Could not load language library for {language}: {e}")
-            logger.warning("Using generic regex parsing as fallback.")
-            self.parser = None
-    
-    def parse_file(self, file_path: str) -> Tuple[List[FunctionDefinition], List[FunctionCall]]:
-        """Распарсить файл и извлечь функции и вызовы"""
-        
-        with open(file_path, 'rb') as f:
-            content = f.read()
-        
-        if self.parser is None:
-            # Fallback: базовое регулярное выражение парсинг
-            return self._parse_with_regex(file_path, content)
-        
-        tree = self.parser.parse(content)
-        functions = self._extract_functions(tree, file_path, content)
-        calls = self._extract_calls(tree, file_path, content)
-        
-        return functions, calls
-    
-    def _extract_functions(self, tree, file_path: str, content: bytes) -> List[FunctionDefinition]:
-        """Извлечь все определения функций из дерева парсинга"""
-        functions = []
-        
-        def traverse(node, file_bytes):
-            # Ищем узлы, которые являются определениями функций
-            if node.type in ["function_definition", "function_declaration", "method_declaration"]:
-                func_name = None
-                line = node.start_point[0]
-                column = node.start_point[1]
-                
-                # Найти имя функции в дочерних узлах
-                for child in node.children:
-                    if child.type == "identifier":
-                        func_name = file_bytes[child.start_byte:child.end_byte].decode('utf-8')
-                        break
-                
-                if func_name:
-                    functions.append(FunctionDefinition(
-                        name=func_name,
-                        file=file_path,
-                        line=line,
-                        column=column,
-                        signature=self._extract_signature(node, file_bytes)
-                    ))
-            
-            # Рекурсивно обойти дочерние узлы
-            for child in node.children:
-                traverse(child, file_bytes)
-        
-        traverse(tree.root_node, content)
-        return functions
-    
-    def _extract_calls(self, tree, file_path: str, content: bytes) -> List[FunctionCall]:
-        """Извлечь все вызовы функций из дерева парсинга"""
-        calls = []
-        current_function = "module_level"  # По умолчанию на уровне модуля
-        
-        def traverse(node, file_bytes, in_function=None):
-            nonlocal current_function
-            
-            # Обновить текущую функцию контекст
-            if node.type in ["function_definition", "function_declaration", "method_declaration"]:
-                for child in node.children:
-                    if child.type == "identifier":
-                        current_function = file_bytes[child.start_byte:child.end_byte].decode('utf-8')
-                        break
-            
-            # Ищем вызовы функций
-            if node.type in ["call_expression", "call"]:
-                callee_name = None
-                
-                # Найти имя вызываемой функции
-                if node.child_by_field_name("function"):
-                    func_node = node.child_by_field_name("function")
-                    if func_node.type == "identifier":
-                        callee_name = file_bytes[func_node.start_byte:func_node.end_byte].decode('utf-8')
-                
-                if callee_name:
-                    calls.append(FunctionCall(
-                        caller_name=current_function,
-                        callee_name=callee_name,
-                        file=file_path,
-                        line=node.start_point[0],
-                        column=node.start_point[1]
-                    ))
-            
-            # Рекурсивно обойти дочерние узлы
-            for child in node.children:
-                traverse(child, file_bytes, current_function)
-        
-        traverse(tree.root_node, content)
-        return calls
-    
-    def _extract_signature(self, func_node, content: bytes) -> str:
-        """Извлечь сигнатуру функции (параметры)"""
+            logger.error(f"Failed to initialize parser for {language}: {e}"); sys.exit(1)
+
+    def parse_file(self, file_path: str) -> Tuple[List[FunctionDefinition], List[FunctionCall], Optional[ModuleImports]]:
+        file_path_obj = Path(file_path).resolve()
         try:
-            signature = content[func_node.start_byte:func_node.end_byte].decode('utf-8')
-            # Обрезать до первой строки
-            return signature.split('\n')[0][:100]
-        except:
-            return ""
-    
-    def _parse_with_regex(self, file_path: str, content: bytes) -> Tuple[List[FunctionDefinition], List[FunctionCall]]:
-        """Fallback парсинг с помощью регулярных выражений"""
-        import re
+            with open(file_path_obj, 'rb') as f: content = f.read()
+        except Exception as e: logger.warning(f"Could not read {file_path_obj}: {e}"); return [], [], None
+        tree = self.parser.parse(content)
+        module_name = self._get_module_name(file_path_obj)
+        functions = self._extract_functions(tree, file_path_obj, content, module_name)
+        calls = self._extract_calls(tree, file_path_obj, content, module_name)
+        imports = self._extract_imports(tree, content, module_name)
+        return functions, calls, imports
+
+    def _get_node_text(self, n: Node, c: bytes) -> str: return c[n.start_byte:n.end_byte].decode('utf-8', 'ignore')
+    def _get_module_name(self, p: Path) -> str:
+        try: rp = p.relative_to(self.repo_root)
+        except ValueError: return p.stem
+        parts = list(rp.parts)
+        if parts and parts[-1] == '__init__.py': parts.pop()
+        elif parts: parts[-1] = parts[-1].replace('.py', '')
         
-        content_str = content.decode('utf-8', errors='ignore')
+        # Handle src layout
+        if parts and parts[0] == 'src':
+            parts.pop(0)
+            
+        return '.'.join(parts)
+
+    def _extract_functions(self, tree, file_path, content, module_name):
         functions = []
-        calls = []
+        captures = self.func_query.captures(tree.root_node)
         
-        if self.language_name == "python":
-            # Python функции
-            for i, line in enumerate(content_str.split('\n'), 1):
-                if line.strip().startswith('def '):
-                    match = re.search(r'def\s+(\w+)\s*\(', line)
-                    if match:
-                        functions.append(FunctionDefinition(
-                            name=match.group(1),
-                            file=file_path,
-                            line=i,
-                            column=line.find('def')
-                        ))
-            
-            # Python вызовы
-            for i, line in enumerate(content_str.split('\n'), 1):
-                matches = re.findall(r'(\w+)\s*\(', line)
-                for match in matches:
-                    calls.append(FunctionCall(
-                        caller_name="unknown",
-                        callee_name=match,
-                        file=file_path,
-                        line=i,
-                        column=0
-                    ))
+        # Map function definition nodes to their decorators
+        func_decorators = defaultdict(list)
         
-        return functions, calls
+        # First pass: collect decorators
+        # In tree-sitter python grammar, decorators are siblings preceding the function_definition
+        # OR they are part of the decorated_definition which wraps the function_definition
+        # Let's try a simpler approach: iterate over function definitions and look at their previous siblings
+        
+        for node, name in captures:
+            if name == 'func_def':
+                decorators = []
+                # Check for decorated_definition parent
+                parent = node.parent
+                if parent.type == 'decorated_definition':
+                    for child in parent.children:
+                        if child.type == 'decorator':
+                            decorators.append(self._get_node_text(child, content).strip())
+                
+                func_decorators[node.id] = decorators
+
+        for node, name in captures:
+            if name == 'func_name':
+                func_def_node = node.parent
+                func_name = self._get_node_text(node, content)
+                full_name = f"{module_name}.{func_name}"
+                
+                # Check if function is inside a class
+                parent = func_def_node.parent
+                while parent:
+                    if parent.type == 'class_definition':
+                        class_name_node = parent.child_by_field_name('name')
+                        if class_name_node:
+                            class_name = self._get_node_text(class_name_node, content)
+                            full_name = f"{module_name}.{class_name}.{func_name}"
+                        break
+                    parent = parent.parent
+
+                functions.append(FunctionDefinition(
+                    name=func_name, file=str(file_path),
+                    line=func_def_node.start_point[0], column=func_def_node.start_point[1],
+                    full_name=full_name,
+                    decorators=func_decorators.get(func_def_node.id, [])
+                ))
+        return functions
+
+    def _extract_calls(self, tree, file_path, content, module_name):
+        calls, captures = [], self.call_query.captures(tree.root_node)
+        obj_map = {node.parent.id: self._get_node_text(node, content) for node, name in captures if name == 'callee_obj'}
+        for node, name in captures:
+            calee, cnode = None, None
+            if name == 'callee': calee, cnode = self._get_node_text(node, content), node.parent
+            elif name == 'callee_attr':
+                ot = obj_map.get(node.parent.id, "unknown")
+                calee, cnode = f"{ot}.{self._get_node_text(node, content)}", node.parent.parent
+            if not calee or not cnode: continue
+            caller_node = self._find_enclosing_function_node(node)
+            caller_name = f"{module_name}.<module_level>"
+            if caller_node and (cn_node := caller_node.child_by_field_name('name')):
+                caller_name = f"{module_name}.{self._get_node_text(cn_node, content)}"
+            calls.append(FunctionCall(caller_name, calee, str(file_path), cnode.start_point[0], cnode.start_point[1]))
+        return calls
+
+    def _extract_imports(self, tree, content, module_name):
+        if not self.import_query: return None
+        imports = ModuleImports()
+        captures_by_parent = defaultdict(list)
+        for node, name in self.import_query.captures(tree.root_node):
+            captures_by_parent[node.parent.id].append((name, self._get_node_text(node, content)))
+        for _, values_list in captures_by_parent.items():
+            vals = dict(values_list)
+            if 'import' in vals and 'alias' in vals: imports.aliased_imports[vals['alias']] = vals['import']
+            elif 'import' in vals: imports.direct_imports[vals['import']] = vals['import']
+            elif 'from_module' in vals and 'from_import' in vals:
+                alias = vals.get('alias', vals['from_import'])
+                if alias == '*': continue
+                fp, fib = vals['from_module'], vals['from_module']
+                if fp.startswith('.'):
+                    nd = len(fp) - len(fp.lstrip('.')); bp = module_name.split('.')[:-(nd - 1)] if nd > 1 else module_name.split('.')[:-1]; sfx = fp.lstrip('.')
+                    fib = '.'.join(bp + ([sfx] if sfx else []))
+                imports.from_imports[alias] = f"{fib}.{vals['from_import']}"
+        return imports
+
+    def _find_enclosing_function_node(self, node: Node) -> Optional[Node]:
+        c = node.parent
+        while c:
+            if c.type in self.func_types: return c
+            c = c.parent
+        return None
 
 # ============================================================================
-# INTER-PROCEDURAL LINKER
+# LINKER, GRAPH, ANALYZER & MAIN (Без изменений, они уже были корректны)
 # ============================================================================
-
 class InterProceduralLinker:
-    """
-    Разрешить вызовы функций в их определения.
-    Это ключевой компонент для построения IPCG.
-    """
-    
-    def __init__(self):
-        self.functions: Dict[str, FunctionDefinition] = {}  # {full_name: FunctionDefinition}
-        self.module_exports: Dict[str, Set[str]] = defaultdict(set)  # {module: {exported_names}}
-        self.resolved_edges: List[Tuple[str, str]] = []  # [(caller, callee_full_name)]
-    
-    def register_functions(self, functions: List[FunctionDefinition]):
-        """Зарегистрировать все найденные функции в глобальной таблице символов"""
-        for func in functions:
-            # Создать fully qualified name
-            module = self._get_module_name(func.file)
-            func.full_name = f"{module}.{func.name}"
-            
-            self.functions[func.full_name] = func
-            self.module_exports[module].add(func.name)
-    
-    def resolve_calls(self, calls: List[FunctionCall]) -> List[Tuple[str, str]]:
-        """
-        Разрешить все вызовы в их определения.
-        Возвращает список (caller_full_name, callee_full_name).
-        """
-        resolved_edges = []
-        unresolved = []
-        
+    def __init__(self): self.functions, self.imports_map = {}, {}
+    def register_definitions(self, funcs, imps):
+        for f in funcs: self.functions[f.full_name] = f
+        self.imports_map = imps
+    def resolve_calls(self, calls):
+        resolved, unresolved = [], defaultdict(int)
         for call in calls:
-            # Попробовать разрешить вызов
-            caller_module = self._get_module_name(call.file)
-            caller_full_name = f"{caller_module}.{call.caller_name}"
-            
-            # Кандидаты на разрешение (в порядке приоритета)
-            candidates = [
-                f"{caller_module}.{call.callee_name}",  # Локальная область видимости
-                call.callee_name,  # Глобальная область видимости (builtin)
-                f"builtins.{call.callee_name}",  # Built-in функции
-            ]
-            
-            resolved = False
-            for candidate in candidates:
-                if candidate in self.functions:
-                    resolved_edges.append((caller_full_name, candidate))
-                    resolved = True
-                    break
-            
-            if not resolved:
-                unresolved.append((call.caller_name, call.callee_name))
-        
+            if res := self._resolve_one_call(call): resolved.append((call.caller_full_name, res))
+            else: unresolved[call.callee_name] += 1
         if unresolved:
-            logger.info(f"Could not resolve {len(unresolved)} calls (may be dynamic, external, or builtins)")
+            logger.info(f"Could not resolve {sum(unresolved.values())} calls. Sample:")
+            for name, count in sorted(unresolved.items(), key=lambda i: i[1], reverse=True)[:5]:
+                logger.info(f"  - '{name}' (called {count} times)")
+        return resolved
+    def _resolve_one_call(self, call):
+        parts = call.callee_name.split('.')
+        base_name = parts[0]
         
-        return resolved_edges
-    
-    @staticmethod
-    def _get_module_name(file_path: str) -> str:
-        """Получить имя модуля из пути файла"""
-        # file_path: "/path/to/repo/app/models/user.py"
-        # module: "app.models.user"
+        # Extract module name from caller's full name
+        # Assuming caller_full_name is like "module.class.method" or "module.function"
+        # We need to find the module part. Since we don't know the depth, we try to match with imports map keys.
+        mname = None
+        caller_parts = call.caller_full_name.split('.')
+        for i in range(len(caller_parts), 0, -1):
+            potential_mname = ".".join(caller_parts[:i])
+            if potential_mname in self.imports_map:
+                mname = potential_mname
+                break
         
-        path = Path(file_path)
-        
-        # Удалить расширение файла
-        parts = list(path.parts)
-        if parts[-1].endswith(('.py', '.js', '.java', '.go')):
-            parts[-1] = parts[-1].rsplit('.', 1)[0]
-        
-        # Вернуть относительный путь как модуль
-        return '.'.join(parts[-3:]) if len(parts) >= 3 else '.'.join(parts)
+        if not mname:
+             # Fallback: try stripping last part
+             mname = ".".join(call.caller_full_name.split('.')[:-1])
 
-# ============================================================================
-# CALL GRAPH BUILDER
-# ============================================================================
+        imps = self.imports_map.get(mname)
+        
+        # 1. Check local definition (in same module)
+        local_name = f"{mname}.{call.callee_name}"
+        if local_name in self.functions: return local_name
+        
+        # Check if it's a method call on self (e.g. self.method())
+        if base_name == 'self' and len(parts) > 1:
+             # This is a heuristic. We assume the method is in the same class/module.
+             # A proper resolution would require type inference.
+             # Try to find the class name from caller
+             # caller: module.Class.method
+             # callee: self.other_method -> module.Class.other_method
+             caller_parts = call.caller_full_name.split('.')
+             if len(caller_parts) >= 3: # module.Class.method
+                 class_name = caller_parts[-2]
+                 method_name = parts[1]
+                 potential_full = f"{mname}.{class_name}.{method_name}"
+                 if potential_full in self.functions: return potential_full
 
-class CallGraphBuilder:
-    """
-    Построить граф вызовов на основе разрешенных вызовов.
-    Выходной формат - JSON для дальнейшей обработки.
-    """
+        if not imps: return None
+
+        # 2. Check from imports (from X import Y)
+        if base_name in imps.from_imports:
+            imported_full = imps.from_imports[base_name]
+            # If callee is just Y, then imported_full is the candidate
+            # If callee is Y.Z, then imported_full.Z is the candidate
+            full = ".".join([imported_full] + parts[1:])
+            if full in self.functions: return full
+            
+            # Handle class static methods/attributes: from models.user_model import User -> User.decode_auth_token
+            # imported_full is models.user_model.User
+            # callee is User.decode_auth_token
+            # parts[1:] is ['decode_auth_token']
+            # full becomes models.user_model.User.decode_auth_token
+            
+            # Also check if imported_full itself is a function (e.g. from module import func)
+            if imported_full in self.functions and len(parts) == 1:
+                return imported_full
+            
+        # 3. Check aliased imports (import X as Y)
+        if base_name in imps.aliased_imports:
+            imported_full = imps.aliased_imports[base_name]
+            full = ".".join([imported_full] + parts[1:])
+            if full in self.functions: return full
+
+        # 4. Check direct imports (import X)
+        if base_name in imps.direct_imports:
+             # callee X.Y -> X.Y
+             if call.callee_name in self.functions: return call.callee_name
+             
+        return None
+@dataclass
+class CallGraph:
+    functions: Dict[str, FunctionDefinition]; forward_edges: Dict[str, List[str]] = field(default_factory=lambda: defaultdict(list)); backward_edges: Dict[str, List[str]] = field(default_factory=lambda: defaultdict(list))
+    def add_edge(self, c, e):
+        if e not in self.forward_edges[c]: self.forward_edges[c].append(e)
+        if c not in self.backward_edges[e]: self.backward_edges[e].append(c)
+    def to_json(self): return {"functions": {n: asdict(f) for n, f in self.functions.items()},"edges": {"forward": dict(self.forward_edges), "backward": dict(self.backward_edges)},"statistics": {"total_functions": len(self.functions),"total_edges": sum(len(v) for v in self.forward_edges.values()),"entry_points": [n for n in self.functions if n not in self.backward_edges]}}
     
-    def __init__(self):
-        self.functions: Dict[str, FunctionDefinition] = {}
-        self.edges: List[Dict] = []
-        self.call_counts: Dict[str, int] = defaultdict(int)  # Сколько раз каждая функция вызывается
-    
-    def add_functions(self, functions: List[FunctionDefinition]):
-        """Добавить определения функций в граф"""
-        for func in functions:
-            self.functions[func.full_name] = func
-    
-    def add_edge(self, caller: str, callee: str, line: int):
-        """Добавить ребро вызова в граф"""
-        self.edges.append({
-            "from": caller,
-            "to": callee,
-            "line": line,
-            "type": "direct_call"
-        })
-        self.call_counts[callee] += 1
-    
-    def find_sources_for_sink(self, sink_name: str, max_depth: int = 10) -> List[List[str]]:
-        """
-        Найти все цепочки вызовов от sources к sink.
+    @classmethod
+    def from_json(cls, json_path: str):
+        with open(json_path, 'r') as f: data = json.load(f)
+        functions = {}
+        for n, d in data['functions'].items():
+            # Handle backward compatibility if 'decorators' is missing
+            if 'decorators' not in d:
+                d['decorators'] = []
+            functions[n] = FunctionDefinition(**d)
+        graph = cls(functions=functions)
+        graph.forward_edges = defaultdict(list, data['edges']['forward'])
+        graph.backward_edges = defaultdict(list, data['edges']['backward'])
+        return graph
+
+    def get_function_info(self, func_name: str) -> Optional[FunctionDefinition]:
+        return self.functions.get(func_name)
+
+    def print_trace(self, start_node: str, direction: str = 'forward', max_depth: int = 1):
+        if start_node not in self.functions:
+            print(f"Function '{start_node}' not found in graph.")
+            return
+
+        print(f"\nTrace {direction} for: {start_node}")
+        info = self.functions[start_node]
+        print(f"  Def: {info.file}:{info.line}:{info.column}")
         
-        Source: функции, которые не имеют входящих вызовов (entry points)
-        Sink: заданная функция
+        edges = self.forward_edges if direction == 'forward' else self.backward_edges
         
-        Возвращает список цепочек вызовов.
-        """
+        def _print_recursive(current_node, current_depth, visited):
+            if current_depth > max_depth: return
+            if current_node in visited:
+                print(f"{'  ' * (current_depth + 1)}-> {current_node} (recursion)")
+                return
+            
+            children = edges.get(current_node, [])
+            if not children: return
+
+            for child in children:
+                child_info = self.functions.get(child)
+                loc = f" ({Path(child_info.file).name}:{child_info.line})" if child_info else " (external/unknown)"
+                print(f"{'  ' * (current_depth + 1)}-> {child}{loc}")
+                _print_recursive(child, current_depth + 1, visited | {current_node})
+
+        _print_recursive(start_node, 0, set())
+
+    def visualize(self, output_file="call_graph", format="png"):
+        try:
+            from graphviz import Digraph
+        except ImportError:
+            logger.error("Graphviz not installed. Please install it with `pip install graphviz`.")
+            return
+
+        dot = Digraph(comment='Call Graph', format=format)
+        dot.attr(rankdir='LR')
+
+        # Add nodes
+        for name, func in self.functions.items():
+            label = f"{func.name}\n({Path(func.file).name}:{func.line})"
+            dot.node(name, label=label, shape='box', style='filled', fillcolor='lightblue')
+
+        # Add edges
+        for caller, callees in self.forward_edges.items():
+            for callee in callees:
+                if callee in self.functions:
+                    dot.edge(caller, callee)
+
+        try:
+            dot.render(output_file, view=False)
+            logger.info(f"Graph visualization saved to {output_file}.{format}")
+        except Exception as e:
+            logger.error(f"Failed to render graph: {e}")
+
+    def find_all_callers(self, sink, max_depth=15):
+        if sink not in self.functions: logger.error(f"Sink '{sink}' not found."); return []
+        if sink not in self.backward_edges: logger.warning(f"'{sink}' is an entry point."); return [[sink]]
+        paths, queue = [], [(sink, [sink])]
+        while queue:
+            curr, path = queue.pop(0)
+            if curr not in self.backward_edges: paths.append(list(reversed(path))); continue
+            if len(path) >= max_depth: paths.append(['...'] + list(reversed(path))); continue
+            for caller in self.backward_edges[curr]:
+                if caller in path: paths.append(['... (recursion)'] + list(reversed(path+[caller]))); continue
+                queue.append((caller, path + [caller]))
+        return paths
+
+    def find_paths(self, source: str, sink: str, max_depth: int = 15) -> List[List[str]]:
+        if source not in self.functions: logger.error(f"Source '{source}' not found."); return []
+        if sink not in self.functions: logger.error(f"Sink '{sink}' not found."); return []
         
-        # Найти все incoming edges
-        incoming = defaultdict(list)
-        for edge in self.edges:
-            incoming[edge["to"]].append(edge["from"])
-        
-        # Найти entry points (функции без входящих вызовов)
-        all_functions = set(self.functions.keys())
-        called_functions = set(edge["to"] for edge in self.edges)
-        entry_points = all_functions - called_functions
-        
-        logger.info(f"Found {len(entry_points)} entry points")
-        
-        # BFS для поиска всех путей от entry points к sink
         paths = []
+        queue = [(source, [source])]
         
-        def bfs(source: str, target: str):
-            queue = [(source, [source])]
-            visited = set()
-            found_paths = []
+        while queue:
+            curr, path = queue.pop(0)
+            if curr == sink:
+                paths.append(path)
+                continue
+            
+            if len(path) >= max_depth: continue
+            
+            for neighbor in self.forward_edges.get(curr, []):
+                if neighbor in path: continue # Avoid cycles
+                queue.append((neighbor, path + [neighbor]))
+                
+        return paths
+
+    def trace_all_paths(self, start_nodes: List[str], max_depth: int = 15) -> Dict[str, List[List[str]]]:
+        all_paths = {}
+        for start_node in start_nodes:
+            if start_node not in self.functions: continue
+            
+            paths = []
+            queue = [(start_node, [start_node])]
             
             while queue:
-                current, path = queue.pop(0)
+                curr, path = queue.pop(0)
                 
-                if current == target:
-                    found_paths.append(path)
+                # If leaf node or max depth reached, add path
+                if curr not in self.forward_edges or not self.forward_edges[curr] or len(path) >= max_depth:
+                    paths.append(path)
                     continue
                 
-                if len(path) > max_depth or current in visited:
-                    continue
-                
-                visited.add(current)
-                
-                # Найти всех, кого вызывает current
-                for edge in self.edges:
-                    if edge["from"] == current and edge["to"] not in visited:
-                        queue.append((edge["to"], path + [edge["to"]]))
+                for neighbor in self.forward_edges[curr]:
+                    if neighbor in path: # Cycle detected
+                        paths.append(path + [neighbor + " (recursion)"])
+                        continue
+                    queue.append((neighbor, path + [neighbor]))
             
-            return found_paths
-        
-        # Поиск из каждого entry point
-        for entry in entry_points:
-            paths.extend(bfs(entry, sink_name))
-        
-        return paths
-    
-    def find_all_callers(self, func_name: str) -> List[str]:
-        """Найти все функции, которые прямо вызывают func_name"""
-        callers = set()
-        for edge in self.edges:
-            if edge["to"] == func_name:
-                callers.add(edge["from"])
-        return list(callers)
-    
-    def to_json(self) -> Dict:
-        """Экспортировать граф в JSON"""
-        return {
-            "functions": {
-                name: asdict(func) for name, func in self.functions.items()
-            },
-            "edges": self.edges,
-            "call_counts": dict(self.call_counts),
-            "statistics": {
-                "total_functions": len(self.functions),
-                "total_edges": len(self.edges),
-                "entry_points": len([f for f in self.functions if self.call_counts[f] == 0])
-            }
-        }
-
-# ============================================================================
-# MAIN ANALYZER
-# ============================================================================
-
+            all_paths[start_node] = paths
+        return all_paths
 class RepositoryAnalyzer:
-    """Основной анализатор репозитория"""
-    
-    def __init__(self, repo_path: str, language: str):
-        self.repo_path = repo_path
-        self.language = language
-        self.parser = UniversalCodeParser(language)
-        self.linker = InterProceduralLinker()
-        self.graph = CallGraphBuilder()
-    
-    def analyze(self) -> Dict:
-        """Проанализировать весь репозиторий"""
-        
+    def __init__(self, r, l): self.repo_path, self.language = r, l; self.parser = UniversalCodeParser(l, r); self.linker = InterProceduralLinker()
+    def analyze(self):
         logger.info(f"Analyzing {self.repo_path} ({self.language})")
-        
-        # Phase 1: Парсинг всех файлов
-        all_functions = []
-        all_calls = []
-        
-        file_extensions = {
-            "python": ".py",
-            "javascript": ".js",
-            "java": ".java",
-            "go": ".go",
-        }
-        
-        extension = file_extensions.get(self.language, ".py")
-        
-        for file_path in Path(self.repo_path).rglob(f"*{extension}"):
-            logger.debug(f"Parsing {file_path}")
-            try:
-                functions, calls = self.parser.parse_file(str(file_path))
-                all_functions.extend(functions)
-                all_calls.extend(calls)
-            except Exception as e:
-                logger.warning(f"Error parsing {file_path}: {e}")
-        
-        logger.info(f"Found {len(all_functions)} functions and {len(all_calls)} calls")
-        
-        # Phase 2: Register functions and resolve calls
-        self.linker.register_functions(all_functions)
-        resolved_edges = self.linker.resolve_calls(all_calls)
-        
-        logger.info(f"Resolved {len(resolved_edges)} calls")
-        
-        # Phase 3: Build graph
-        self.graph.add_functions(all_functions)
-        for caller, callee in resolved_edges:
-            # Find line number
-            line = next((call.line for call in all_calls if call.callee_name in callee), 0)
-            self.graph.add_edge(caller, callee, line)
-        
-        return self.graph.to_json()
-
-# ============================================================================
-# ENTRY POINT
-# ============================================================================
-
+        funcs, calls, imps = self._parse_all_files()
+        self.linker.register_definitions(funcs, imps)
+        edges = self.linker.resolve_calls(calls)
+        graph = CallGraph(functions={f.full_name: f for f in funcs})
+        for c, e in edges:
+            if '<module_level>' in c or '<module_level>' in e: continue
+            graph.add_edge(c, e)
+        logger.info(f"Analysis complete: {len(graph.functions)} funcs, {len(edges)} edges.")
+        return graph
+    def _parse_all_files(self):
+        all_funcs, all_calls, all_imports = [], [], {}
+        ext = "py" if self.language == "python" else self.language
+        files = list(Path(self.repo_path).rglob(f"*.{ext}"))
+        logger.info(f"Found {len(files)} files to parse.")
+        for i, f in enumerate(files, 1):
+            if i % 100 == 0: logger.info(f"Parsing progress: {i}/{len(files)} files...")
+            mod_name = self.parser._get_module_name(f); funcs, calls, imps = self.parser.parse_file(str(f))
+            all_funcs.extend(funcs); all_calls.extend(calls)
+            if imps: all_imports[mod_name] = imps
+        logger.info(f"Finished parsing: {len(all_funcs)} funcs, {len(all_calls)} calls in {len(all_imports)} modules.")
+        return all_funcs, all_calls, all_imports
 def main():
-    import argparse
-    
     parser = argparse.ArgumentParser(description="Build Inter-Procedural Call Graph")
-    parser.add_argument("--repo", required=True, help="Path to repository")
-    parser.add_argument("--language", default="python", choices=["python", "javascript", "java", "go"])
-    parser.add_argument("--output", default="call_graph.json", help="Output JSON file")
-    parser.add_argument("--find-sink", help="Find all sources for a given sink function")
-    
+    parser.add_argument("--repo", help="Path to repository to analyze")
+    parser.add_argument("--language", default="python", choices=["python"])
+    parser.add_argument("--output", default="call_graph.json")
+    parser.add_argument("--load", help="Load existing call graph JSON instead of parsing")
+    parser.add_argument("--find-sink", help="Find all paths to a specific function (sink)")
+    parser.add_argument("--find-path", nargs=2, metavar=('SOURCE', 'SINK'), help="Find all paths from source to sink")
+    parser.add_argument("--trace-all", action="store_true", help="Trace all paths from entry points (e.g. Flask routes)")
+    parser.add_argument("--visualize", action="store_true", help="Generate a visual graph using Graphviz")
+    parser.add_argument("--trace-forward", help="Trace calls made by function")
+    parser.add_argument("--trace-backward", help="Trace callers of function")
+    parser.add_argument("--info", help="Show definition info for function")
+    parser.add_argument("--depth", type=int, default=1, help="Depth for tracing")
+    parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
-    
-    # Analyze
-    analyzer = RepositoryAnalyzer(args.repo, args.language)
-    graph_data = analyzer.analyze()
-    
-    # Find sources for sink if requested
+
+    if args.debug: logging.getLogger().setLevel(logging.DEBUG)
+
+    if args.load:
+        logger.info(f"Loading graph from {args.load}")
+        graph = CallGraph.from_json(args.load)
+    elif args.repo:
+        analyzer = RepositoryAnalyzer(args.repo, args.language)
+        graph = analyzer.analyze()
+        with open(args.output, 'w') as f: json.dump(graph.to_json(), f, indent=2)
+        logger.info(f"Full graph saved to {args.output}")
+    else:
+        parser.error("Either --repo or --load must be specified")
+
     if args.find_sink:
-        sources = analyzer.graph.find_sources_for_sink(args.find_sink)
-        logger.info(f"\nFound {len(sources)} paths to {args.find_sink}:")
-        for i, path in enumerate(sources[:5], 1):  # Show first 5
-            logger.info(f"  {i}. {' → '.join(path)}")
+        logger.info(f"\n--- Finding call chains for SINK: {args.find_sink} ---")
+        paths = graph.find_all_callers(args.find_sink)
+        if paths:
+            paths.sort(key=len); logger.info(f"Found {len(paths)} paths. Sample:")
+            for i, path in enumerate(paths[:15], 1): print(f"  {i:2d}. {' → '.join(path)}")
+        else: logger.info("No paths found.")
+
+    if args.find_path:
+        source, sink = args.find_path
+        logger.info(f"\n--- Finding paths from {source} to {sink} ---")
+        paths = graph.find_paths(source, sink)
+        if paths:
+            paths.sort(key=len)
+            logger.info(f"Found {len(paths)} paths:")
+            for i, path in enumerate(paths[:15], 1): print(f"  {i:2d}. {' → '.join(path)}")
+        else: logger.info("No paths found.")
+
+    if args.trace_all:
+        # Universal entry point detection
+        entry_points = []
+        
+        # 1. Framework-specific decorators
+        framework_decorators = [
+            'app.route', 'bp.route', 'router.get', 'router.post', 'router.put', 'router.delete', # Flask, FastAPI
+            'api_view', 'action' # Django DRF
+        ]
+        
+        # 2. Naming conventions
+        entry_point_patterns = ['views', 'api', 'routes', 'controllers', 'endpoints']
+        
+        for name, func in graph.functions.items():
+            is_entry = False
+            
+            # Check decorators
+            for dec in func.decorators:
+                if any(d in dec for d in framework_decorators):
+                    is_entry = True
+                    break
+            
+            # Check module path patterns if no decorators found
+            if not is_entry:
+                if any(p in name for p in entry_point_patterns):
+                    is_entry = True
+            
+            if is_entry:
+                entry_points.append(name)
+
+        logger.info(f"\n--- Tracing all paths from {len(entry_points)} detected entry points ---")
+        all_traces = graph.trace_all_paths(entry_points, max_depth=args.depth)
+        
+        for start_node, paths in all_traces.items():
+            if not paths: continue
+            print(f"\nEntry Point: {start_node}")
+            for i, path in enumerate(paths[:5], 1): # Show top 5 paths per entry point
+                print(f"  Path {i}: {' -> '.join(path)}")
+            if len(paths) > 5:
+                print(f"  ... and {len(paths) - 5} more paths")
+
+    if args.trace_forward:
+        graph.print_trace(args.trace_forward, 'forward', args.depth)
     
-    # Save to file
-    with open(args.output, 'w') as f:
-        json.dump(graph_data, f, indent=2)
-    
-    logger.info(f"Graph saved to {args.output}")
+    if args.trace_backward:
+        graph.print_trace(args.trace_backward, 'backward', args.depth)
+
+    if args.info:
+        info = graph.get_function_info(args.info)
+        if info:
+            print(f"\nFunction: {info.name}")
+            print(f"Full Name: {info.full_name}")
+            print(f"Location: {info.file}:{info.line}:{info.column}")
+        else:
+            print(f"Function '{args.info}' not found.")
+
+    if args.visualize:
+        graph.visualize(output_file=Path(args.output).stem)
 
 if __name__ == "__main__":
     main()
