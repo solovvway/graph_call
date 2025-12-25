@@ -19,11 +19,10 @@ import logging
 # Tree-Sitter парсинг
 try:
     from tree_sitter import Language, Parser
-    # Import the helper to get prebuilt languages
-    from tree_sitter_languages import get_language
 except ImportError:
-    print("Install required packages: pip install tree-sitter tree-sitter-languages")
+    print("Install tree-sitter: pip install tree-sitter")
     sys.exit(1)
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -116,17 +115,17 @@ class UniversalCodeParser:
     }
     
     def __init__(self, language: str):
-        """Initialize parser for a specific language using prebuilt binaries"""
+        """Инициализировать парсер для конкретного языка"""
         self.language_name = language
         self.parser = Parser()
         
+        # Загрузить library для языка
+        # Требует наличия libpython.so, libtree-sitter-javascript.so и т.д.
         try:
-            # Use tree-sitter-languages to load the prebuilt grammar
-            lang_lib = get_language(language)
+            lang_lib = Language(f"build/my-{language}.so", language)
             self.parser.set_language(lang_lib)
         except Exception as e:
-            logger.warning(f"Could not load language library for {language}: {e}")
-            logger.warning("Using generic regex parsing as fallback.")
+            logger.warning(f"Could not load language library: {e}. Using generic parsing.")
             self.parser = None
     
     def parse_file(self, file_path: str) -> Tuple[List[FunctionDefinition], List[FunctionCall]]:
