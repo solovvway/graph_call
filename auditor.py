@@ -18,8 +18,9 @@ NEW requested features:
 - --out DIR : save all traces and code traces:
     DIR/1.txt, DIR/1_code.txt, DIR/2.txt, DIR/2_code.txt, ...
 
-Install:
-  pip install tree-sitter tree-sitter-languages graphviz
+MODIFICATION:
+- trace_all now starts from ALL sources (e.g. $_GET in a file), not just WEB_ENTRY points.
+  This allows finding vulnerabilities in files not directly linked from a main entry point.
 """
 
 import os, sys, logging, argparse, shutil, warnings, re
@@ -1218,18 +1219,27 @@ class SecurityGraph:
         self.out_dir = out_dir
 
         print(f"\n{'='*30} VULNERABILITY REPORT {'='*30}")
-        entries = [uid for uid, n in self.nodes.items() if n.is_entry]
-        sources = [uid for uid, n in self.nodes.items() if n.is_source]
+        
+        # ==================== ИЗМЕНЕНИЕ НАЧАЛО ====================
+        # Используем множества для автоматической дедупликации
+        entries = {uid for uid, n in self.nodes.items() if n.is_entry}
+        sources = {uid for uid, n in self.nodes.items() if n.is_source}
+        
         print(f"Total Nodes: {len(self.nodes)} | WEB Entry Points: {len(entries)} | Sources: {len(sources)} | Sink Nodes: {len(self.sinks_found)}")
         self._print_sink_summary(top=30)
+
+        # Объединяем точки входа и источники данных в единый список стартовых точек для трассировки
+        start_points = entries | sources
+        # ==================== ИЗМЕНЕНИЕ КОНЕЦ ====================
 
         if not self.sinks_found:
             print("No dangerous sinks detected.")
             return
 
-        if not entries:
-            print("[WARN] No WEB entrypoints detected. (May need framework-specific route patterns.)")
-
+        if not start_points:
+            print("\n[WARN] No WEB entrypoints or data Sources found. Unable to start trace.")
+            # Даже если нет стартовых точек, все равно покажем обратную трассировку от синков
+        
         paths_found = 0
         max_depth = 16
 
@@ -1245,17 +1255,22 @@ class SecurityGraph:
                 if neighbor not in visited_local:
                     dfs(neighbor, path + [neighbor], visited_local | {neighbor})
 
-        # Trace from WEB entrypoints only
-        for entry in entries:
-            dfs(entry, [entry], {entry})
+        # ==================== ИЗМЕНЕНИЕ НАЧАЛО ====================
+        # Запускаем трассировку от ВСЕХ стартовых точек (entry points + sources)
+        for start_node in start_points:
+            dfs(start_node, [start_node], {start_node})
+        # ==================== ИЗМЕНЕНИЕ КОНЕЦ ====================
 
         if paths_found == 0:
-            print("\n[INFO] No direct paths from WEB Entry Points found.")
+            print("\n[INFO] No paths from WEB Entry Points or Sources to Sinks found.")
             print("Showing immediate callers of Sinks (Backward Trace):")
             for sink in sorted(self.sinks_found):
                 callers = list(self.rev_adj.get(sink, []))
-                for c in callers[:10]:
-                    self._emit_trace([c, sink])
+                # Покажем хотя бы один пример вызова для каждого "осиротевшего" синка
+                for c in callers[:1]:
+                    # Проверяем, что у вызывающей функции есть источник данных, чтобы не показывать совсем бесполезные пути
+                    if self.nodes[c].is_source:
+                       self._emit_trace([c, sink])
 
     def visualize(self, filename="vuln_graph"):
         if not shutil.which("dot"):
