@@ -13,6 +13,11 @@ Fixes requested:
 - Report now includes: total sink callsites and per-sink counts across repository,
   not only reachable paths from WEB entrypoints.
 
+NEW requested features:
+- --code : for each function in each trace, show its code snippet as well (in console output).
+- --out DIR : save all traces and code traces:
+    DIR/1.txt, DIR/1_code.txt, DIR/2.txt, DIR/2_code.txt, ...
+
 Install:
   pip install tree-sitter tree-sitter-languages graphviz
 """
@@ -227,6 +232,7 @@ class Node:
     name: str
     file: str
     line: int
+    end_line: int = 0
     is_sink: bool = False
     is_entry: bool = False       # WEB entrypoint only
     is_source: bool = False      # SOURCE (currently: PHP superglobals/php://input)
@@ -270,31 +276,6 @@ def safe_text(content: bytes, node) -> str:
     except Exception:
         return ""
 
-def build_line_index(content: bytes) -> List[int]:
-    """Return list of byte offsets where each line starts (0-based)."""
-    idx = [0]
-    for m in re.finditer(b"\n", content):
-        idx.append(m.end())
-    return idx
-
-def byte_to_line(line_starts: List[int], b: int) -> int:
-    """Convert byte offset to 1-based line number."""
-    # binary search
-    lo, hi = 0, len(line_starts) - 1
-    if hi < 0:
-        return 1
-    if b < 0:
-        return 1
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        if line_starts[mid] <= b and (mid == len(line_starts) - 1 or line_starts[mid + 1] > b):
-            return mid + 1
-        if line_starts[mid] > b:
-            hi = mid - 1
-        else:
-            lo = mid + 1
-    return 1
-
 # ============================================================================
 # PARSER ENGINE
 # ============================================================================
@@ -329,8 +310,17 @@ class CodeParser:
         global_uid = f"{module_id}.<global>"
         global_is_entry = self._is_web_global_entry_file(path)
         global_is_source = self._is_php_source_text(content.decode("utf-8", "ignore")) if self.lang == "php" else False
-        nodes.append(Node(uid=global_uid, name="<global>", file=str(path), line=1,
-                          is_entry=global_is_entry, is_source=global_is_source))
+        file_end_line = content.count(b"\n") + 1
+
+        nodes.append(Node(
+            uid=global_uid,
+            name="<global>",
+            file=str(path),
+            line=1,
+            end_line=file_end_line,
+            is_entry=global_is_entry,
+            is_source=global_is_source
+        ))
 
         # Regular functions/methods
         nodes.extend(self._extract_functions(tree, path, content, module_id))
@@ -388,88 +378,50 @@ class CodeParser:
     # -----------------------------
     def _is_web_global_entry_file(self, path: Path) -> bool:
         name = path.name.lower()
-        # Нормализуем путь для кроссплатформенного сравнения
         p = str(path).replace("\\", "/").lower()
 
-        # --- Python (Flask, FastAPI, Django) ---
         if self.lang == "python":
-            # app.py/main.py - стандарты для микрофреймворков
-            # urls.py - точка входа маршрутизации Django
-            # wsgi/asgi.py - точки входа серверов
             if name in {"app.py", "main.py", "server.py", "urls.py", "wsgi.py", "asgi.py", "routes.py"}:
                 return True
             return False
 
-        # --- JavaScript / TypeScript (Node.js, Express, Next.js) ---
-        if self.lang in {"javascript", "typescript", "javascriptreact", "typescriptreact"}:
-            # Стандартные точки входа Node.js
+        if self.lang in {"javascript", "typescript", "javascriptreact", "typescriptreact", "tsx"}:
             if name in {"app.js", "server.js", "index.js", "main.js", "app.ts", "server.ts", "index.ts", "main.ts"}:
                 return True
-            # Файлы маршрутизации
             if name in {"routes.js", "router.js", "routes.ts", "router.ts"}:
                 return True
-            # Next.js (App Router / Pages)
             if name in {"page.tsx", "page.js", "_app.js", "_app.tsx", "layout.tsx"}:
-                # Лучше проверить, что они не в корне components, но для грубой оценки пойдет
                 return True
             return False
 
-        # --- PHP (Vanilla, Laravel, Symfony) ---
         if self.lang == "php":
-            # Стандартная точка входа
             if name == "index.php":
                 return True
-            # Laravel/Symfony роутинг
             if "/routes/" in p and name in {"web.php", "api.php", "routes.php"}:
                 return True
             return False
 
-        # --- C# (ASP.NET Core) ---
         if self.lang == "c_sharp":
-            # Program.cs - современная точка входа (.NET 6+)
-            # Startup.cs - старая точка входа (.NET 5 и ниже)
             if name in {"program.cs", "startup.cs"}:
                 return True
             return False
 
-        # --- Java (Spring Boot) ---
         if self.lang == "java":
-            # Обычно класс с @SpringBootApplication называется Application.java или Main.java
             if name in {"application.java", "main.java", "webconfig.java"}:
                 return True
             return False
 
-        # --- Go (Gin, Echo, Stdlib) ---
         if self.lang == "go":
-            # Go приложения почти всегда стартуют с main.go в пакете main
-            # Часто роуты выносят в router.go или routes.go
             if name in {"main.go", "router.go", "routes.go", "server.go"}:
                 return True
             return False
 
-        # --- Ruby (Ruby on Rails) ---
         if self.lang == "ruby":
-            # config.ru - Rack entry point
-            # routes.rb - Rails routing definition (самое важное для анализа путей)
             if name in {"config.ru", "routes.rb", "application.rb"}:
                 return True
             return False
 
-        # --- Scala (Play Framework) ---
-        if self.lang == "scala":
-            # Play Framework хранит роуты в файле без расширения или .routes
-            if name == "routes" and "/conf/" in p:
-                return True
-            return False
-
-        # --- Rust (Actix, Rocket) ---
-        if self.lang == "rust":
-            if name == "main.rs":
-                return True
-            return False
-
         return False
-
 
     # -----------------------------
     # PHP SOURCES detection
@@ -511,128 +463,89 @@ class CodeParser:
                 def_text = safe_text(content, def_node)
                 is_source = self._is_php_source_text(def_text)
 
-            nodes.append(Node(uid=uid, name=name, file=str(path), line=cap_node.start_point[0] + 1,
-                              is_entry=is_entry, is_source=is_source))
+            start_line = def_node.start_point[0] + 1
+            end_line = def_node.end_point[0] + 1
+
+            nodes.append(Node(
+                uid=uid, name=name, file=str(path),
+                line=start_line, end_line=end_line,
+                is_entry=is_entry, is_source=is_source
+            ))
+
         return nodes
 
     def _is_web_entry_by_definition_annotation(self, def_node, content: bytes) -> bool:
         txt = safe_text(content, def_node)
         low = txt.lower()
 
-        # --- Python (Flask, FastAPI, Django) ---
         if self.lang == "python":
-            # Decorators: @app.route, @app.get, @router.post, etc.
             if "@" in txt:
                 keys = [
-                    ".route", " route",  # Flask, generic
-                    ".get", ".post", ".put", ".delete", ".patch", ".options", ".head",  # FastAPI / Flask views
-                    "websocket"  # FastAPI/Starlette
+                    ".route", " route",
+                    ".get", ".post", ".put", ".delete", ".patch", ".options", ".head",
+                    "websocket"
                 ]
                 if any(k in low for k in keys):
                     return True
-            
-            # Django patterns (urls.py): path('...', ...), re_path('...', ...)
             if "path(" in low or "re_path(" in low:
                 return True
-            
             return False
 
-        # --- JavaScript / TypeScript (Express, NestJS, Fastify) ---
-        if self.lang in ("javascript", "typescript", "javascriptreact", "typescriptreact"):
-            # Express.js / Fastify style: app.get(...), router.post(...)
+        if self.lang in ("javascript", "typescript", "javascriptreact", "typescriptreact", "tsx"):
             call_patterns = [
                 "app.get(", "app.post(", "app.put(", "app.delete(", "app.patch(",
                 "router.get(", "router.post(", "router.put(", "router.delete(", "router.patch(",
-                "route(" # Generic
+                "route("
             ]
             if any(p in low for p in call_patterns):
                 return True
-            
-            # NestJS Decorators: @Get, @Post, @Controller, etc.
+
             if "@" in txt:
                 nest_keys = ["@get", "@post", "@put", "@delete", "@patch", "@options", "@head", "@requestmapping"]
                 if any(k in low for k in nest_keys):
                     return True
-                    
             return False
 
-        # --- Java (Spring Boot) ---
         if self.lang == "java":
-            # Spring Annotations
             spring_annotations = [
-                "@requestmapping", "@getmapping", "@postmapping", 
+                "@requestmapping", "@getmapping", "@postmapping",
                 "@putmapping", "@deletemapping", "@patchmapping"
             ]
             return any(a in low for a in spring_annotations)
 
-        # --- C# (ASP.NET Core) ---
         if self.lang == "c_sharp":
-            # Attributes: [HttpGet], [Route], etc.
             attributes = [
-                "[httpget", "[httppost", "[httpput", "[httpdelete", "[httppatch", 
+                "[httpget", "[httppost", "[httpput", "[httpdelete", "[httppatch",
                 "[route", "[acceptverbs"
             ]
             if any(a in low for a in attributes):
                 return True
-            
-            # Minimal APIs: app.MapGet(...), app.MapPost(...)
-            map_patterns = [
-                ".mapget", ".mappost", ".mapput", ".mapdelete", ".mappatch", ".mapgroup"
-            ]
+
+            map_patterns = [".mapget", ".mappost", ".mapput", ".mapdelete", ".mappatch", ".mapgroup"]
             if any(m in low for m in map_patterns):
                 return True
-            
+
             return False
 
-        # --- PHP (Laravel, Symfony) ---
         if self.lang == "php":
-            # PHP 8 Attributes (#[Route]) or Annotations (@Route)
             return ("#[route" in low) or ("@route" in low)
 
-        # --- Go (Gin, Echo, Stdlib) ---
         if self.lang == "go":
-            # router.GET, app.POST, etc.
-            # Including dot to avoid matching variable names ending in get/post
-            go_patterns = [
-                ".get(", ".post(", ".put(", ".delete(", ".patch(", 
-                ".group(", ".handlefunc("
-            ]
+            go_patterns = [".get(", ".post(", ".put(", ".delete(", ".patch(", ".group(", ".handlefunc("]
             return any(p in low for p in go_patterns)
 
-        # --- Rust (Actix-web, Rocket) ---
-        if self.lang == "rust":
-            # Attributes: #[get(...)], #[post(...)]
-            rust_attrs = ["#[get", "#[post", "#[put", "#[delete", "#[patch", "#[route"]
-            return any(a in low for a in rust_attrs)
-
-        # --- Ruby (Rails, Sinatra) ---
         if self.lang == "ruby":
-            # Rails routes.rb often uses bare methods: get '...', post '...'
-            # We look for the pattern with quotes to be safer
             ruby_patterns = [
-                "get '", 'get "', 
-                "post '", 'post "', 
-                "put '", 'put "', 
-                "delete '", 'delete "', 
+                "get '", 'get "',
+                "post '", 'post "',
+                "put '", 'put "',
+                "delete '", 'delete "',
                 "patch '", 'patch "',
                 "resources :"
             ]
             return any(p in low for p in ruby_patterns)
 
-        # --- Kotlin (Ktor) ---
-        if self.lang == "kotlin":
-            # DSL: get(...) { }, post(...) { }
-            # Often used inside routing { ... }
-            ktor_patterns = ["get(", "post(", "put(", "delete(", "patch(", "route("]
-            return any(p in low for p in ktor_patterns)
-
-        # --- R (Plumber) ---
-        if self.lang == "r":
-            # Special comments: #* @get, #* @post
-            return "#* @" in low and any(v in low for v in ["get", "post", "put", "delete"])
-
         return False
-
 
     # -----------------------------
     # Call extraction (graph edges)
@@ -699,7 +612,6 @@ class CodeParser:
             "require_once_expression": "require_once",
             "include_expression": "include",
             "include_once_expression": "include_once",
-            # some grammars use *_statement:
             "require_statement": "require",
             "require_once_statement": "require_once",
             "include_statement": "include",
@@ -711,7 +623,6 @@ class CodeParser:
             if n.type in type_map:
                 callee = type_map[n.type]
             else:
-                # heuristic by node.type
                 t = n.type.lower()
                 if "require" in t:
                     callee = "require_once" if "once" in t else "require"
@@ -724,26 +635,21 @@ class CodeParser:
             caller_uid = find_scope_uid(n)
             out.append(Edge(src=caller_uid, dst=callee, file=str(path), line=n.start_point[0] + 1))
 
-        # 2) Regex fallback with comment stripping (catches grammar differences and also weird constructs)
-        # NOTE: this can still catch tokens in strings; comment stripping reduces false positives a bit.
+        # 2) Regex fallback with comment stripping
         text = content.decode("utf-8", "ignore")
         text_wo_comments = PHP_BLOCK_COMMENT_RE.sub("", text)
         text_wo_comments = PHP_LINE_COMMENT_RE.sub("", text_wo_comments)
 
-        line_starts = build_line_index(content)
-        # finditer on bytes would give byte offsets; easier: on text, but we need byte offset -> line.
-        # We'll approximate line by counting '\n' in prefix (fast enough for fallback).
         for m in PHP_REQUIRE_REGEX.finditer(text_wo_comments):
             kw = m.group(1).lower()
-            # approximate line:
             line = text_wo_comments.count("\n", 0, m.start()) + 1
-            caller_uid = f"{module_id}.<global>"  # safe fallback when we don't map exact scope by bytes
+            caller_uid = f"{module_id}.<global>"  # fallback
             out.append(Edge(src=caller_uid, dst=kw, file=str(path), line=line))
 
         return out
 
     # -----------------------------
-    # WEB entrypoint extraction from route registrations (Node/PHP/Python etc.)
+    # WEB entrypoint extraction from route registrations
     # -----------------------------
     def _extract_web_entrypoints(self, tree, path: Path, content: bytes, module_id: str, nodes: List[Node]) -> Set[str]:
         by_name_local: Dict[str, List[str]] = defaultdict(list)
@@ -764,7 +670,6 @@ class CodeParser:
         elif self.lang == "go":
             entry_uids |= self._web_entries_go(tree, content, module_id, by_name_local)
 
-        # (ruby/java/c_sharp omitted here for brevity; not your priority)
         return entry_uids
 
     def _web_entries_python(self, tree, content: bytes, module_id: str,
@@ -822,23 +727,38 @@ class CodeParser:
                     out.add(uid)
             elif handler.type in {"arrow_function", "function_expression"}:
                 uid = mk_anon_uid(handler.start_point[0])
-                nodes.append(Node(uid=uid, name=f"<anon@{handler.start_point[0]+1}>",
-                                  file=str(path), line=handler.start_point[0] + 1,
-                                  is_entry=True))
+                nodes.append(Node(
+                    uid=uid,
+                    name=f"<anon@{handler.start_point[0]+1}>",
+                    file=str(path),
+                    line=handler.start_point[0] + 1,
+                    end_line=handler.end_point[0] + 1,
+                    is_entry=True
+                ))
                 out.add(uid)
 
         return out
 
     def _web_entries_php(self, tree, path: Path, content: bytes, module_id: str,
-                        by_name_local: Dict[str, List[str]], nodes: List[Node]) -> Set[str]:
+                         by_name_local: Dict[str, List[str]], nodes: List[Node]) -> Set[str]:
         out: Set[str] = set()
-        route_methods = {"get", "post", "put", "delete", "patch", "options", "any", "match", "resource", "apiresource", "group"}
+        route_methods = {
+            "get", "post", "put", "delete", "patch", "options",
+            "any", "match", "resource", "apiresource", "group"
+        }
 
         def add_anon(line0: int, closure_text: str) -> str:
             uid = f"{module_id}.<anon@{line0+1}>"
             is_source = self._is_php_source_text(closure_text)
-            nodes.append(Node(uid=uid, name=f"<anon@{line0+1}>", file=str(path), line=line0 + 1,
-                              is_entry=True, is_source=is_source))
+            nodes.append(Node(
+                uid=uid,
+                name=f"<anon@{line0+1}>",
+                file=str(path),
+                line=line0 + 1,
+                end_line=line0 + max(0, closure_text.count("\n")) + 1,
+                is_entry=True,
+                is_source=is_source
+            ))
             return uid
 
         for n in walk(tree.root_node):
@@ -871,6 +791,7 @@ class CodeParser:
                 out.add(add_anon(handler.start_point[0], htxt))
                 continue
 
+            # ["Controller", "method"]
             if htxt.startswith("[") and htxt.endswith("]"):
                 m2 = re.findall(r"['\"]([A-Za-z0-9_]+)['\"]", htxt)
                 if m2:
@@ -879,6 +800,7 @@ class CodeParser:
                         out.add(uid)
                 continue
 
+            # 'Controller@method'
             if ("@" in htxt) and (htxt.startswith(("'", '"'))):
                 s = htxt.strip("'\"")
                 parts = s.split("@", 1)
@@ -891,7 +813,7 @@ class CodeParser:
         return out
 
     def _web_entries_go(self, tree, content: bytes, module_id: str,
-                       by_name_local: Dict[str, List[str]]) -> Set[str]:
+                        by_name_local: Dict[str, List[str]]) -> Set[str]:
         out: Set[str] = set()
         for n in walk(tree.root_node):
             if n.type != "call_expression":
@@ -927,13 +849,26 @@ class SecurityGraph:
 
         self.sinks_found: Set[str] = set()
 
+        # NEW: trace output options
+        self.show_code: bool = False
+        self.out_dir: Optional[Path] = None
+        self._trace_counter: int = 0
+        self._file_text_cache: Dict[str, List[str]] = {}
+
     def add_node(self, n: Node):
         if n.uid in self.nodes:
             old = self.nodes[n.uid]
             old.is_entry = old.is_entry or n.is_entry
             old.is_sink = old.is_sink or n.is_sink
             old.is_source = old.is_source or n.is_source
+
+            if n.end_line and (old.end_line == 0 or n.end_line > old.end_line):
+                old.end_line = n.end_line
+            if n.line and (old.line == 0 or n.line < old.line):
+                old.line = n.line
+
             return
+
         self.nodes[n.uid] = n
         if n.is_sink:
             self.sinks_found.add(n.uid)
@@ -951,7 +886,7 @@ class SecurityGraph:
             target_uid = f"builtin.{lang}.{callee_norm}"
             if target_uid not in self.nodes:
                 self.nodes[target_uid] = Node(
-                    uid=target_uid, name=callee_norm, file="<builtin>", line=0,
+                    uid=target_uid, name=callee_norm, file="<builtin>", line=0, end_line=0,
                     is_sink=True, is_builtin=True
                 )
             self.sinks_found.add(target_uid)
@@ -973,7 +908,7 @@ class SecurityGraph:
             if not target_uid:
                 target_uid = f"ext.{lang}.{callee_norm}"
                 if target_uid not in self.nodes:
-                    self.nodes[target_uid] = Node(target_uid, callee_norm, "<external>", 0, is_builtin=True)
+                    self.nodes[target_uid] = Node(target_uid, callee_norm, "<external>", 0, end_line=0, is_builtin=True)
 
         # traversal connectivity
         self.adj[caller_uid].add(target_uid)
@@ -989,10 +924,10 @@ class SecurityGraph:
             return "<unknown source>"
         if n.file == "<external>":
             return "<external lib>"
-        try:
-            return f"{Path(n.file).relative_to(Path.cwd())}:{n.line}"
-        except Exception:
-            return f"{n.file}:{n.line}"
+        loc = f"{n.file}:{n.line}"
+        if n.end_line and n.end_line != n.line:
+            loc = f"{n.file}:{n.line}-{n.end_line}"
+        return loc
 
     def _label(self, uid: str) -> str:
         n = self.nodes[uid]
@@ -1002,30 +937,94 @@ class SecurityGraph:
         if n.is_sink: tags.append("SINK")
         return f"{n.name}" + (f" [{'|'.join(tags)}]" if tags else "")
 
-    def _print_formatted_path(self, path: List[str]):
+    # -----------------------------
+    # NEW: code extraction and trace emission
+    # -----------------------------
+    def _get_file_lines(self, file_path: str) -> List[str]:
+        if file_path in self._file_text_cache:
+            return self._file_text_cache[file_path]
+        try:
+            txt = Path(file_path).read_text(encoding="utf-8", errors="ignore")
+            lines = txt.splitlines()
+        except Exception:
+            lines = []
+        self._file_text_cache[file_path] = lines
+        return lines
+
+    def _node_code(self, uid: str, max_lines: int = 400) -> str:
+        n = self.nodes[uid]
+        if n.is_builtin or n.file in {"<external>", "unknown", "<builtin>"}:
+            return ""
+
+        lines = self._get_file_lines(n.file)
+        if not lines:
+            return ""
+
+        start = max(1, int(n.line or 1))
+        end = int(n.end_line or n.line or start)
+        end = max(start, end)
+
+        # keep output bounded
+        if (end - start + 1) > max_lines:
+            end = start + max_lines - 1
+
+        snippet = lines[start - 1:end]
+        return "\n".join(snippet)
+
+    def _path_to_text(self, path: List[str], include_code: bool) -> str:
+        out: List[str] = []
         names = [self._label(uid) for uid in path]
-        print(f"\n[PATH] {' -> '.join(names)}")
+        out.append(f"[PATH] {' -> '.join(names)}")
+        out.append("")
+
         for uid in path:
             n = self.nodes[uid]
-            print(f"   {self._label(uid)} ({self._format_loc(n)})")
+            out.append(f"{self._label(uid)} ({self._format_loc(n)})")
+            if include_code:
+                code = self._node_code(uid)
+                if code:
+                    out.append("----- CODE BEGIN -----")
+                    out.append(code)
+                    out.append("----- CODE END -----")
+            out.append("")
 
-        # also print callsite(s) for last hop if present
+        # callsites for each hop
         if len(path) >= 2:
-            src, dst = path[-2], path[-1]
-            sites = self.edge_sites.get((src, dst), [])
-            if sites:
-                # show up to 8 sites to avoid spam
-                uniq = list(dict.fromkeys(sites))[:8]
-                print("   callsites:")
+            out.append("callsites:")
+            for i in range(len(path) - 1):
+                src, dst = path[i], path[i + 1]
+                sites = self.edge_sites.get((src, dst), [])
+                if not sites:
+                    continue
+                uniq = list(dict.fromkeys(sites))[:20]
+                out.append(f"  {self._label(src)} -> {self._label(dst)}")
                 for f, ln in uniq:
-                    try:
-                        rel = str(Path(f).resolve().relative_to(Path.cwd()))
-                    except Exception:
-                        rel = f
-                    print(f"     - {rel}:{ln}")
+                    out.append(f"    - {f}:{ln}")
+            out.append("")
+
+        return "\n".join(out)
+
+    def _emit_trace(self, path: List[str]):
+        self._trace_counter += 1
+        trace_id = self._trace_counter
+
+        # Console output
+        print(self._path_to_text(path, include_code=self.show_code))
+
+        # File output
+        if self.out_dir:
+            self.out_dir.mkdir(parents=True, exist_ok=True)
+
+            (self.out_dir / f"{trace_id}.txt").write_text(
+                self._path_to_text(path, include_code=False),
+                encoding="utf-8", errors="ignore"
+            )
+            (self.out_dir / f"{trace_id}_code.txt").write_text(
+                self._path_to_text(path, include_code=True),
+                encoding="utf-8", errors="ignore"
+            )
 
     def _print_sink_summary(self, top: int = 20):
-        # count sink callsites (dst is a sink node)
         sink_counts: Dict[str, int] = defaultdict(int)
         for (src, dst), sites in self.edge_sites.items():
             if dst in self.nodes and self.nodes[dst].is_sink:
@@ -1040,7 +1039,10 @@ class SecurityGraph:
         for dst, cnt in ranked:
             print(f"  - {self.nodes[dst].name}: {cnt}")
 
-    def trace_all(self):
+    def trace_all(self, show_code: bool = False, out_dir: Optional[Path] = None):
+        self.show_code = show_code
+        self.out_dir = out_dir
+
         print(f"\n{'='*30} VULNERABILITY REPORT {'='*30}")
         entries = [uid for uid, n in self.nodes.items() if n.is_entry]
         sources = [uid for uid, n in self.nodes.items() if n.is_source]
@@ -1061,7 +1063,7 @@ class SecurityGraph:
             nonlocal paths_found
             if self.nodes[curr].is_sink:
                 paths_found += 1
-                self._print_formatted_path(path)
+                self._emit_trace(path)
                 return
             if len(path) > max_depth:
                 return
@@ -1069,7 +1071,7 @@ class SecurityGraph:
                 if neighbor not in visited_local:
                     dfs(neighbor, path + [neighbor], visited_local | {neighbor})
 
-        # Trace from WEB entrypoints only (as requested)
+        # Trace from WEB entrypoints only
         for entry in entries:
             dfs(entry, [entry], {entry})
 
@@ -1079,7 +1081,7 @@ class SecurityGraph:
             for sink in sorted(self.sinks_found):
                 callers = list(self.rev_adj.get(sink, []))
                 for c in callers[:10]:
-                    self._print_formatted_path([c, sink])
+                    self._emit_trace([c, sink])
 
     def visualize(self, filename="vuln_graph"):
         if not shutil.which("dot"):
@@ -1117,12 +1119,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", required=True, help="Path to repository")
     ap.add_argument("--visualize", action="store_true", help="Generate PNG")
+    ap.add_argument("--code", action="store_true", help="Show code for each function in every trace")
+    ap.add_argument("--out", help="Output directory to save traces: N.txt and N_code.txt")
     args = ap.parse_args()
 
     repo = Path(args.repo).resolve()
     if not repo.exists():
         print(f"Repo not found: {repo}")
         sys.exit(2)
+
+    out_dir = Path(args.out).resolve() if args.out else None
 
     graph = SecurityGraph()
     files_map: Dict[str, List[Path]] = defaultdict(list)
@@ -1153,7 +1159,8 @@ def main():
     for e, lang in all_raw_edges:
         graph.add_edge(e.src, e.dst, lang, e.file, e.line)
 
-    graph.trace_all()
+    graph.trace_all(show_code=args.code, out_dir=out_dir)
+
     if args.visualize:
         graph.visualize()
 

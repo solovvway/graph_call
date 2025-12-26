@@ -9,3 +9,5 @@ nextcloud
 server
 caln_graph
 phpmyadmin
+out
+*.zip
