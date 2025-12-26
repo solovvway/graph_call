@@ -703,7 +703,7 @@ class CodeParser:
             return False
 
         if self.lang == "php":
-            return ("#[route" in low) or ("@route" in low)
+            return ("#[route" in low) or ("@route" in low) or ("Route" in low)
 
         if self.lang == "go":
             go_patterns = [".get(", ".post(", ".put(", ".delete(", ".patch(", ".group(", ".handlefunc("]

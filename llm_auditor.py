@@ -112,12 +112,19 @@ class LLMClient:
             f"Original snippet (line {match['line']} of {match['file']}):\n{match['code']}\n"
             f"--- Context (±10 lines) ---\n{context}"
         )
-        response_str = await self._chat(system, user)
-        try:
-            return json.loads(response_str)
-        except json.JSONDecodeError:
-            logger.warning(f"Failed to parse JSON response: {response_str}")
-            return {"vulnerability": False, "reasoning": "Failed to parse LLM response"}
+        
+        max_retries = 3
+        for attempt in range(max_retries):
+            response_str = await self._chat(system, user)
+            try:
+                return json.loads(response_str)
+            except json.JSONDecodeError:
+                logger.warning(f"Failed to parse JSON response (attempt {attempt + 1}/{max_retries}): {response_str}")
+                if attempt < max_retries - 1:
+                    user += f"\n\nYour previous response was not valid JSON. Please provide a valid JSON object."
+                else:
+                    return {"vulnerability": False, "reasoning": "Failed to parse LLM response after retries"}
+        return {"vulnerability": False, "reasoning": "Failed to parse LLM response"}
 
 class LLMSecurityGraph(SecurityGraph):
     def __init__(self, llm_client: LLMClient, reports_dir: Path):
@@ -212,8 +219,8 @@ async def async_main():
         print(f"Repo not found: {repo}")
         sys.exit(2)
 
-    out_dir = Path(args.out).resolve() if args.out else None
-    reports_dir = Path(args.reports).resolve()
+    out_dir = (Path(args.out).resolve() / repo.name) if args.out else None
+    reports_dir = Path(args.reports).resolve() / repo.name
 
     # Load config from JSON if provided
     base_url = args.base_url
