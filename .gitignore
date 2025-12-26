@@ -5,3 +5,7 @@ VAmPI
 *.json
 venv
 call_graph*
+nextcloud
+server
+caln_graph
+phpmyadmin
