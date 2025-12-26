@@ -1,381 +1,361 @@
 #!/usr/bin/env python3
 """
-Multi-Language Security Call Graph Builder (IPCG)
-Построение графа вызовов с отслеживанием путей от Entry Points (роутов) до Sinks (опасных функций).
-Поддерживает: Python, JavaScript/TypeScript, Java, Go, PHP, Ruby, C#.
+Advanced Security Call Graph Auditor (ASCG) - FORMAT FIXED FINAL
+Унифицированный инструмент для трассировки путей от Entry Points до уязвимых Sinks.
 """
-import os, json, sys, logging, argparse
+import os, sys, logging, argparse, shutil, warnings
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Set
-from dataclasses import dataclass, asdict, field
+from typing import Dict, List, Set, Tuple
+from dataclasses import dataclass
 from collections import defaultdict
+
+# Suppress library warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
 
 try:
     from tree_sitter_languages import get_language, get_parser
 except ImportError:
-    print("Error: Missing libraries. Run: pip install tree-sitter tree-sitter-languages")
+    print("CRITICAL: Missing libraries. Run: pip install tree-sitter tree-sitter-languages graphviz")
     sys.exit(1)
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# LANGUAGE CONFIGURATION & VULNERABILITY SINKS
+# CONFIGURATION
 # ============================================================================
-# Списки опасных функций (Sinks), аналогичные тем, что ищут Regex'ы
 KNOWN_SINKS = {
-    "python": {"exec", "eval", "compile", "open", "os.system", "os.popen", "subprocess.Popen", "subprocess.call", "pickle.loads", "yaml.load", "cursor.execute"},
-    "javascript": {"eval", "setTimeout", "setInterval", "child_process.exec", "child_process.spawn", "document.write", "innerHTML", "dangerouslySetInnerHTML"},
-    "java": {"Runtime.exec", "ProcessBuilder.start", "Statement.execute", "Statement.executeQuery", "Class.forName"},
-    "php": {"exec", "system", "passthru", "shell_exec", "eval", "popen", "proc_open", "mysqli_query", "query"},
-    "go": {"os.StartProcess", "exec.Command", "sql.Query", "template.Execute"},
-    "ruby": {"eval", "system", "exec", "syscall", "open", "send"},
-    "c_sharp": {"Process.Start", "SqlCommand", "ExecuteNonQuery", "ExecuteReader"}
+    "python": {
+        "exec", "eval", "compile", "open", "execfile", "input", "__import__",
+        "os.system", "os.popen", "os.spawn", "subprocess.Popen", "subprocess.call", "subprocess.run",
+        "pickle.loads", "yaml.load", "marshal.load", "shelve.open",
+        "sqlite3.connect", "cursor.execute", "flask.render_template_string"
+    },
+    "javascript": {
+        "eval", "setTimeout", "setInterval", "Function",
+        "child_process.exec", "child_process.spawn", "child_process.execFile",
+        "document.write", "document.writeln", "innerHTML", "outerHTML", "dangerouslySetInnerHTML"
+    },
+    "java": {"Runtime.exec", "ProcessBuilder.start", "Statement.execute", "Statement.executeQuery"},
+    "php": {"exec", "system", "passthru", "shell_exec", "eval", "popen", "proc_open", "mysqli_query"},
+    "go": {"os.StartProcess", "exec.Command", "sql.Query", "sql.Exec", "template.Execute"},
+    "ruby": {"eval", "system", "exec", "syscall", "open", "send", "public_send"}
 }
 
-LANG_QUERIES = {
+LANG_CONFIG = {
     "python": {
         "funcs": """(function_definition name: (identifier) @name) @def""",
-        "calls": """(call function: [(identifier) @callee (attribute object: (_) @obj attribute: (identifier) @attr)])""",
-        "routes": ["app.route", "bp.route", "router.get", "router.post"]
+        "calls": """
+            (call function: (identifier) @callee) 
+            (call function: (attribute attribute: (identifier) @callee))
+        """,
+        "entry_heuristics": ["test_", "handler", "view", "controller", "route", "api", "endpoint", "app"]
     },
     "javascript": {
         "funcs": """
             (function_declaration name: (identifier) @name) @def
             (method_definition name: (property_identifier) @name) @def
-            (arrow_function) @def
+            (variable_declarator name: (identifier) @name value: [(arrow_function) (function_expression)]) @def
         """,
-        "calls": """(call_expression function: [(identifier) @callee (member_expression property: (property_identifier) @attr)])""",
-        "routes": ["router.get", "app.get", "app.post", "router.post"]
-    },
-    "java": {
-        "funcs": """(method_declaration name: (identifier) @name) @def""",
-        "calls": """(method_invocation name: (identifier) @callee)""",
-        "routes": ["@GetMapping", "@PostMapping", "@RequestMapping"]
-    },
-    "php": {
-        "funcs": """(function_definition name: (name) @name) @def""",
-        "calls": """(function_call_expression function: (qualified_name) @callee) (member_call_expression name: (name) @attr)""",
-        "routes": ["Route::get", "Route::post"]
-    },
-    "go": {
-        "funcs": """(function_declaration name: (identifier) @name) @def""",
-        "calls": """(call_expression function: [(identifier) @callee (selector_expression field: (field_identifier) @attr)])""",
-        "routes": ["router.GET", "http.HandleFunc"]
-    },
-     "ruby": {
-        "funcs": """(method name: (identifier) @name) @def""",
-        "calls": """(call method: (identifier) @callee)""",
-        "routes": ["get", "post", "match"]
-    },
+        "calls": """
+            (call_expression function: (identifier) @callee)
+            (call_expression function: (member_expression property: (property_identifier) @callee))
+        """,
+        "entry_heuristics": ["router", "app", "handle", "controller", "test"]
+    }
 }
 
-FILE_EXTENSIONS = {
-    ".py": "python", ".js": "javascript", ".ts": "javascript", 
+EXT_TO_LANG = {
+    ".py": "python", ".js": "javascript", ".ts": "javascript", ".jsx": "javascript",
     ".java": "java", ".go": "go", ".php": "php", ".rb": "ruby", ".cs": "c_sharp"
 }
 
 # ============================================================================
-# DATA MODELS
+# MODELS
 # ============================================================================
 @dataclass
-class FunctionNode:
+class Node:
+    uid: str
     name: str
-    full_name: str
     file: str
     line: int
-    is_external: bool = False  # True для builtins/libs
-    is_sink: bool = False      # True для опасных функций
-    is_entry: bool = False     # True для роутов
+    is_sink: bool = False
+    is_entry: bool = False
+    is_builtin: bool = False
 
 @dataclass
-class CallEdge:
-    caller: str
-    callee: str
+class Edge:
+    src: str
+    dst: str
     file: str
     line: int
 
 # ============================================================================
-# ANALYZER CORE
+# PARSER ENGINE
 # ============================================================================
-class MultiLangParser:
-    def __init__(self, language: str):
-        self.lang_name = language
-        self.query_config = LANG_QUERIES.get(language, {})
+class CodeParser:
+    def __init__(self, lang: str):
+        self.lang = lang
+        self.config = LANG_CONFIG.get(lang, LANG_CONFIG.get("python")) 
+        
+        # Fallbacks
+        if lang not in LANG_CONFIG:
+             if lang == "java": self.config = {"funcs": "(method_declaration name: (identifier) @name) @def", "calls": "(method_invocation name: (identifier) @callee)", "entry_heuristics": ["Controller", "Mapping"]}
+             elif lang == "go": self.config = {"funcs": "(function_declaration name: (identifier) @name) @def", "calls": "(call_expression function: (identifier) @callee)", "entry_heuristics": ["Handler", "Func"]}
+             elif lang == "php": self.config = {"funcs": "(function_definition name: (name) @name) @def", "calls": "(function_call_expression function: (qualified_name) @callee)", "entry_heuristics": ["Action", "Controller"]}
+             
         try:
-            self.parser = get_parser(language)
-            self.lang_lib = get_language(language)
-        except Exception as e:
-            logger.error(f"Language {language} not supported: {e}")
+            self.parser = get_parser(lang)
+            self.lib = get_language(lang)
+        except Exception:
             self.parser = None
 
-    def parse(self, file_path: str, content: bytes) -> Tuple[List[FunctionNode], List[CallEdge]]:
-        if not self.parser or not self.query_config: return [], []
+    def parse_file(self, path: str, content: bytes) -> Tuple[List[Node], List[Edge]]:
+        if not self.parser: return [], []
+        try:
+            tree = self.parser.parse(content)
+        except Exception as e:
+            logger.warning(f"Parse error {path}: {e}")
+            return [], []
         
-        tree = self.parser.parse(content)
-        funcs = self._extract_funcs(tree, file_path, content)
-        calls = self._extract_calls(tree, file_path, content, funcs)
-        return funcs, calls
+        module_name = Path(path).stem
+        nodes = self._extract_functions(tree, path, content, module_name)
+        edges = self._extract_calls(tree, path, content, module_name)
+        return nodes, edges
 
-    def _get_text(self, node, content):
+    def _get_text(self, node, content) -> str:
         return content[node.start_byte:node.end_byte].decode('utf-8', 'ignore')
 
-    def _extract_funcs(self, tree, file_path, content):
+    def _extract_functions(self, tree, path, content, module) -> List[Node]:
         nodes = []
-        q = self.lang_lib.query(self.query_config['funcs'])
-        captures = q.captures(tree.root_node)
+        try:
+            query = self.lib.query(self.config['funcs'])
+            captures = query.captures(tree.root_node)
+        except Exception:
+            return []
         
-        # Simple module naming: filename without ext
-        module = Path(file_path).stem
-
         for node, tag in captures:
             if tag == 'name':
-                func_name = self._get_text(node, content)
-                full_name = f"{module}.{func_name}"
-                
-                # Heuristic for Entry Points (scan for decorators or usage of "route" in file)
+                name = self._get_text(node, content)
+                uid = f"{module}.{name}"
                 is_entry = False
-                parent_text = self._get_text(node.parent, content)
-                for route_sig in self.query_config.get('routes', []):
-                    if route_sig in parent_text or "Controller" in str(file_path):
-                        is_entry = True
-                        break
+                
+                # Check decorators
+                parent = node.parent
+                if parent:
+                    parent_text = self._get_text(parent, content)
+                    if "@" in parent_text or "#[" in parent_text: 
+                        if any(x in parent_text for x in ["route", "get", "post", "mapping"]): is_entry = True
+                
+                # Check naming
+                if any(h in name.lower() for h in self.config.get('entry_heuristics', [])):
+                    is_entry = True
 
-                nodes.append(FunctionNode(
-                    name=func_name, full_name=full_name, file=str(file_path),
-                    line=node.start_point[0] + 1, is_entry=is_entry
-                ))
+                nodes.append(Node(uid, name, str(path), node.start_point[0]+1, is_entry=is_entry))
         return nodes
 
-    def _extract_calls(self, tree, file_path, content, defined_funcs):
+    def _extract_calls(self, tree, path, content, module) -> List[Edge]:
         edges = []
-        q = self.lang_lib.query(self.query_config['calls'])
-        captures = q.captures(tree.root_node)
+        try:
+            query = self.lib.query(self.config['calls'])
+            captures = query.captures(tree.root_node)
+        except Exception:
+            return []
         
-        module = Path(file_path).stem
-        
-        # Map ranges to functions to find "caller"
-        def find_caller(node_start):
-            for f in defined_funcs:
-                # This assumes simple sequential functions. 
-                # Better approach: check node range containment.
-                pass 
-            return f"{module}.<script_scope>" # Default
+        def find_scope(n):
+            curr = n.parent
+            while curr:
+                if curr.type.endswith('definition') or curr.type.endswith('declaration') or 'function' in curr.type:
+                    child = curr.child_by_field_name('name')
+                    if child: return f"{module}.{self._get_text(child, content)}"
+                curr = curr.parent
+            return f"{module}.<global>"
 
         for node, tag in captures:
-            callee_name = None
             if tag == 'callee':
-                callee_name = self._get_text(node, content)
-            elif tag == 'attr':
-                # Handle obj.method() -> method
-                callee_name = self._get_text(node, content)
-            
-            if callee_name:
-                # Find enclosing function (caller)
-                curr = node
-                caller_name = f"{module}.<global>"
-                while curr:
-                    if curr.type in ['function_definition', 'function_declaration', 'method_definition', 'method_declaration']:
-                        # Try to find name child
-                        child_name = curr.child_by_field_name('name')
-                        if child_name:
-                            caller_name = f"{module}.{self._get_text(child_name, content)}"
-                        break
-                    curr = curr.parent
-
-                edges.append(CallEdge(caller=caller_name, callee=callee_name, file=str(file_path), line=node.start_point[0]+1))
+                callee_raw = self._get_text(node, content)
+                caller_uid = find_scope(node)
+                edges.append(Edge(caller_uid, callee_raw, str(path), node.start_point[0]+1))
+                
         return edges
 
 # ============================================================================
-# GRAPH BUILDER
+# GRAPH LOGIC
 # ============================================================================
-class CallGraph:
+class SecurityGraph:
     def __init__(self):
-        self.nodes: Dict[str, FunctionNode] = {}
-        self.forward: Dict[str, Set[str]] = defaultdict(set)
-        self.backward: Dict[str, Set[str]] = defaultdict(set)
-        self.sinks: Set[str] = set()
-        self.entries: Set[str] = set()
+        self.nodes: Dict[str, Node] = {}
+        self.adj: Dict[str, Set[str]] = defaultdict(set)
+        self.rev_adj: Dict[str, Set[str]] = defaultdict(set)
+        self.sinks_found: Set[str] = set()
 
-    def add_node(self, node: FunctionNode):
-        self.nodes[node.full_name] = node
-        if node.is_sink: self.sinks.add(node.full_name)
-        if node.is_entry: self.entries.add(node.full_name)
+    def add_node(self, n: Node):
+        self.nodes[n.uid] = n
+        if n.is_sink: self.sinks_found.add(n.uid)
 
-    def resolve_and_add_edge(self, edge: CallEdge, lang: str):
-        # 1. Try exact match (local function)
-        # We need to find the callee in our nodes.
-        # Since we only captured "short names" in calls (e.g., "exec"), we need heuristics.
-        
-        target_full_name = None
-        
-        # Check against known Sinks first (Implicit Global)
+    def add_edge(self, caller_uid: str, callee_name: str, lang: str):
+        if caller_uid not in self.nodes:
+            self.nodes[caller_uid] = Node(caller_uid, caller_uid.split('.')[-1], "unknown", 0)
+
+        target_uid = None
         sinks = KNOWN_SINKS.get(lang, set())
         
-        # Heuristic 1: Is it a dangerous sink?
-        # Check simple name (exec) or dot name (os.system)
-        if edge.callee in sinks or any(edge.callee.endswith(f".{s}") for s in sinks):
-            target_full_name = f"builtin.{edge.callee}"
-            if target_full_name not in self.nodes:
-                self.add_node(FunctionNode(
-                    name=edge.callee, full_name=target_full_name, file="<builtin>", 
-                    line=0, is_external=True, is_sink=True
-                ))
+        is_sink = (callee_name in sinks) or any(callee_name.endswith("." + s) for s in sinks)
+        if is_sink:
+            target_uid = f"builtin.{callee_name}"
+            if target_uid not in self.nodes:
+                self.nodes[target_uid] = Node(target_uid, callee_name, "<builtin>", 0, is_sink=True, is_builtin=True)
+                self.sinks_found.add(target_uid)
         
-        # Heuristic 2: Match against defined functions (Module.func)
-        if not target_full_name:
-            # Try to find a function named 'callee' in the same module or others
-            candidates = [k for k, v in self.nodes.items() if v.name == edge.callee]
-            if candidates:
-                # Pick best match (same file/module priority)
-                # Simplified: pick first
-                target_full_name = candidates[0]
+        if not target_uid:
+            caller_mod = caller_uid.rsplit('.', 1)[0]
+            candidate_local = f"{caller_mod}.{callee_name}"
+            if candidate_local in self.nodes:
+                target_uid = candidate_local
+            else:
+                matches = [uid for uid, n in self.nodes.items() if n.name == callee_name]
+                if matches: target_uid = matches[0]
+
+        if not target_uid:
+            target_uid = f"ext.{callee_name}"
+            if target_uid not in self.nodes:
+                self.nodes[target_uid] = Node(target_uid, callee_name, "<external>", 0, is_builtin=True)
+
+        self.adj[caller_uid].add(target_uid)
+        self.rev_adj[target_uid].add(caller_uid)
+
+    def _print_formatted_path(self, path: List[str]):
+        """Helper to print path in A -> B -> C format with details below."""
+        # 1. Names Chain
+        names = [self.nodes[uid].name for uid in path]
+        arrow_str = " -> ".join(names)
+        print(f"\n[🔴 PATH] {arrow_str}")
         
-        # Heuristic 3: External/Lib call (Unknown)
-        if not target_full_name:
-            target_full_name = f"external.{edge.callee}"
-            if target_full_name not in self.nodes:
-                 self.add_node(FunctionNode(
-                    name=edge.callee, full_name=target_full_name, file="<external>", 
-                    line=0, is_external=True, is_sink=False
-                ))
+        # 2. Details for each function (file path and line)
+        for uid in path:
+            n = self.nodes[uid]
+            if n.is_builtin:
+                loc = "<builtin>"
+            elif n.file == "unknown":
+                loc = "<unknown source>"
+            elif n.file == "<external>":
+                loc = "<external lib>"
+            else:
+                try:
+                    loc = f"{Path(n.file).relative_to(os.getcwd())}:{n.line}"
+                except ValueError:
+                    loc = f"{n.file}:{n.line}"
+            print(f"   {n.name} ({loc})")
 
-        # Add Edge
-        if edge.caller not in self.nodes:
-            # Ensure caller exists (e.g. global scope)
-            self.add_node(FunctionNode(edge.caller, edge.caller, edge.file, 0))
-            
-        self.forward[edge.caller].add(target_full_name)
-        self.backward[target_full_name].add(edge.caller)
-
-    def trace_routes_to_sinks(self):
-        """Finds paths from Entry Points to Sinks"""
-        results = []
-        if not self.entries:
-            logger.warning("No explicit entry points found. Analyzing ALL functions as potential starts.")
-            starts = [n for n in self.nodes if not self.nodes[n].is_external]
-        else:
-            starts = list(self.entries)
-
-        logger.info(f"Tracing from {len(starts)} start points to {len(self.sinks)} sinks...")
+    def trace_all(self):
+        print(f"\n{'='*30} VULNERABILITY REPORT {'='*30}")
+        print(f"Total Nodes: {len(self.nodes)} | Sinks Found: {len(self.sinks_found)}")
         
-        memo = {}
+        entries = [uid for uid, n in self.nodes.items() if n.is_entry]
+        print(f"Entry Points: {len(entries)}")
 
-        def get_paths(curr, path_stack):
-            if curr in self.sinks:
-                return [[curr]]
-            if len(path_stack) > 15: return [] # Depth limit
-            
-            paths = []
-            for neighbor in self.forward.get(curr, []):
-                if neighbor in path_stack: continue # Cycle
-                
-                suffixes = get_paths(neighbor, path_stack + [neighbor])
-                for suf in suffixes:
-                    paths.append([curr] + suf)
-            return paths
+        if not self.sinks_found:
+            print("No dangerous sinks detected.")
+            return
 
-        found_any = False
-        for start in starts:
-            paths = get_paths(start, [start])
-            if paths:
-                found_any = True
-                print(f"\n[VULNERABILITY TRACE] From {start}:")
-                for p in paths[:5]: # Limit output
-                    chain = " -> ".join([self.nodes[n].name for n in p])
-                    print(f"  🔴 Path: {chain}")
-                    print(f"     (Sink: {p[-1]} in {self.nodes[p[-1]].file})")
+        paths_found = 0
+        def dfs(curr, path, visited_local):
+            nonlocal paths_found
+            if self.nodes[curr].is_sink:
+                paths_found += 1
+                self._print_formatted_path(path)
+                return
 
-        if not found_any:
-            print("\nNo paths from Routes to Sinks found.")
+            if len(path) > 12: return
 
-    def visualize(self, output="graph"):
+            for neighbor in self.adj.get(curr, []):
+                if neighbor not in visited_local:
+                    dfs(neighbor, path + [neighbor], visited_local | {neighbor})
+
+        # 1. Forward Trace
+        for entry in entries:
+            dfs(entry, [entry], {entry})
+
+        # 2. Backward Trace (if needed or for extra info)
+        if paths_found == 0:
+            print("\n[INFO] No direct paths from Entry Points found.")
+            print("Showing immediate callers of Sinks (Backward Trace):")
+            for sink in self.sinks_found:
+                callers = self.rev_adj.get(sink, [])
+                if callers:
+                    # Form little paths: Caller -> Sink
+                    for c in list(callers)[:5]: # Limit to 5 per sink
+                        # Construct a mini-path for display
+                        path = [c, sink]
+                        self._print_formatted_path(path)
+
+    def visualize(self, filename="vuln_graph"):
+        if not shutil.which("dot"):
+            logger.warning("Graphviz 'dot' not found. Visualization skipped. (Install 'graphviz' pkg)")
+            return
+
         try:
             from graphviz import Digraph
-            dot = Digraph(comment='Security Call Graph', format='png')
-            dot.attr(rankdir='LR')
+            dot = Digraph(comment='Security Graph', format='png')
+            dot.attr(rankdir='LR', overlap='false')
             
-            for uid, node in self.nodes.items():
-                color = 'lightgrey'
-                shape = 'box'
-                if node.is_sink: 
-                    color = 'red'; shape='ellipse'
-                elif node.is_entry:
-                    color = 'green'
-                elif node.is_external:
-                    color = 'lightblue'
-                
-                label = f"{node.name}\n{Path(node.file).name}:{node.line}"
-                dot.node(uid, label=label, style='filled', fillcolor=color, shape=shape)
-            
-            for src, dests in self.forward.items():
+            for uid, n in self.nodes.items():
+                if n.is_sink:
+                    dot.node(uid, label=f"{n.name}\n(SINK)", style='filled', fillcolor='#ffcccc', color='red')
+                elif n.is_entry:
+                    dot.node(uid, label=f"{n.name}", style='filled', fillcolor='#ccffcc')
+                elif not n.is_builtin:
+                     dot.node(uid, label=f"{n.name}\n{Path(n.file).name}")
+
+            for src, dests in self.adj.items():
                 for dst in dests:
-                    dot.edge(src, dst)
-            
-            dot.render(output, view=False)
-            logger.info(f"Graph saved to {output}.png")
+                    color = 'red' if dst in self.sinks_found else '#666666'
+                    dot.edge(src, dst, color=color)
+
+            dot.render(filename, view=False)
+            logger.info(f"Graph saved to {filename}.png")
         except Exception as e:
-            logger.error(f"Visualization failed: {e}")
+            logger.error(f"Visualization error: {e}")
 
 # ============================================================================
 # MAIN
 # ============================================================================
 def main():
-    parser = argparse.ArgumentParser(description="Security Call Graph Auditor")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--repo", required=True, help="Path to repository")
     parser.add_argument("--visualize", action="store_true", help="Generate PNG")
     args = parser.parse_args()
 
-    repo_path = Path(args.repo).resolve()
-    graph = CallGraph()
-    
-    # 1. Identify Files
-    files_by_lang = defaultdict(list)
-    for root, _, files in os.walk(repo_path):
+    repo = Path(args.repo).resolve()
+    graph = SecurityGraph()
+    files_map = defaultdict(list)
+
+    for root, _, files in os.walk(repo):
         for f in files:
             ext = Path(f).suffix
-            if ext in FILE_EXTENSIONS:
-                files_by_lang[FILE_EXTENSIONS[ext]].append(Path(root) / f)
+            if ext in EXT_TO_LANG:
+                files_map[EXT_TO_LANG[ext]].append(Path(root)/f)
 
-    # 2. Parse & Build Nodes
-    all_edges = []
-    
-    for lang, files in files_by_lang.items():
-        logger.info(f"Parsing {len(files)} {lang} files...")
-        parser_inst = MultiLangParser(lang)
-        
-        for fpath in files:
+    all_raw_edges = []
+    for lang, paths in files_map.items():
+        logger.info(f"Analyzing {len(paths)} {lang} files...")
+        parser_eng = CodeParser(lang)
+        for p in paths:
             try:
-                with open(fpath, 'rb') as f: content = f.read()
-                funcs, calls = parser_inst.parse(str(fpath), content)
-                
-                for fn in funcs: 
-                    graph.add_node(fn)
-                
-                # Store edges to link after all nodes are known
-                for edge in calls:
-                    all_edges.append((edge, lang))
-                    
-            except Exception as e:
-                logger.warning(f"Failed to parse {fpath}: {e}")
+                with open(p, 'rb') as f: content = f.read()
+                nodes, edges = parser_eng.parse_file(str(p), content)
+                for n in nodes: graph.add_node(n)
+                for e in edges: all_raw_edges.append((e, lang))
+            except Exception:
+                pass
 
-    # 3. Resolve Edges (Link Phase)
-    logger.info(f"Resolving {len(all_edges)} calls...")
-    for edge, lang in all_edges:
-        graph.resolve_and_add_edge(edge, lang)
+    logger.info(f"Linking {len(all_raw_edges)} calls...")
+    for e, lang in all_raw_edges:
+        graph.add_edge(e.src, e.dst, lang)
 
-    # 4. Analyze Paths
-    print(f"\n{'='*60}")
-    print(f"ANALYSIS REPORT: {repo_path}")
-    print(f"Nodes: {len(graph.nodes)} | Edges: {sum(len(x) for x in graph.forward.values())}")
-    print(f"Detected Sinks (Builtins/Libs): {len(graph.sinks)}")
-    print(f"Detected Entry Points (Routes): {len(graph.entries)}")
-    print(f"{'='*60}")
-
-    graph.trace_routes_to_sinks()
-
+    graph.trace_all()
     if args.visualize:
-        graph.visualize("security_trace")
+        graph.visualize()
 
 if __name__ == "__main__":
     main()

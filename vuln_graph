@@ -1,0 +1,7 @@
+// Security Graph
+digraph {
+	overlap=false rankdir=LR splines=true
+	subgraph cluster_sinks {
+		color=red label="Dangerous Sinks"
+	}
+}
