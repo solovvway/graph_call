@@ -3,3 +3,5 @@ fastapi
 VAmPI
 *.png
 *.json
+venv
+call_graph*

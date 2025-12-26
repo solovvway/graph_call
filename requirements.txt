@@ -1,4 +1,5 @@
-# tree-sitter==0.21.1
-# tree-sitter-languages==1.10.2
-tree-sitter
-tree-sitter-languages
+tree-sitter==0.21.1
+tree-sitter-languages==1.10.2
+# tree-sitter
+# tree-sitter-languages
+graphviz
