@@ -11,3 +11,5 @@ caln_graph
 phpmyadmin
 out
 *.zip
+repos
+__pycache__
