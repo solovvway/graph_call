@@ -388,28 +388,88 @@ class CodeParser:
     # -----------------------------
     def _is_web_global_entry_file(self, path: Path) -> bool:
         name = path.name.lower()
+        # Нормализуем путь для кроссплатформенного сравнения
         p = str(path).replace("\\", "/").lower()
 
-        if self.lang == "php":
-            if name == "index.php":
-                return True
-            if "/public/index.php" in p:
-                return True
-            if "/routes/web.php" in p or "/routes/api.php" in p:
+        # --- Python (Flask, FastAPI, Django) ---
+        if self.lang == "python":
+            # app.py/main.py - стандарты для микрофреймворков
+            # urls.py - точка входа маршрутизации Django
+            # wsgi/asgi.py - точки входа серверов
+            if name in {"app.py", "main.py", "server.py", "urls.py", "wsgi.py", "asgi.py", "routes.py"}:
                 return True
             return False
 
-        if self.lang in {"javascript", "typescript", "tsx"}:
+        # --- JavaScript / TypeScript (Node.js, Express, Next.js) ---
+        if self.lang in {"javascript", "typescript", "javascriptreact", "typescriptreact"}:
+            # Стандартные точки входа Node.js
             if name in {"app.js", "server.js", "index.js", "main.js", "app.ts", "server.ts", "index.ts", "main.ts"}:
                 return True
+            # Файлы маршрутизации
+            if name in {"routes.js", "router.js", "routes.ts", "router.ts"}:
+                return True
+            # Next.js (App Router / Pages)
+            if name in {"page.tsx", "page.js", "_app.js", "_app.tsx", "layout.tsx"}:
+                # Лучше проверить, что они не в корне components, но для грубой оценки пойдет
+                return True
             return False
 
-        if self.lang == "python":
-            if name in {"app.py", "main.py", "wsgi.py", "asgi.py"}:
+        # --- PHP (Vanilla, Laravel, Symfony) ---
+        if self.lang == "php":
+            # Стандартная точка входа
+            if name == "index.php":
+                return True
+            # Laravel/Symfony роутинг
+            if "/routes/" in p and name in {"web.php", "api.php", "routes.php"}:
+                return True
+            return False
+
+        # --- C# (ASP.NET Core) ---
+        if self.lang == "c_sharp":
+            # Program.cs - современная точка входа (.NET 6+)
+            # Startup.cs - старая точка входа (.NET 5 и ниже)
+            if name in {"program.cs", "startup.cs"}:
+                return True
+            return False
+
+        # --- Java (Spring Boot) ---
+        if self.lang == "java":
+            # Обычно класс с @SpringBootApplication называется Application.java или Main.java
+            if name in {"application.java", "main.java", "webconfig.java"}:
+                return True
+            return False
+
+        # --- Go (Gin, Echo, Stdlib) ---
+        if self.lang == "go":
+            # Go приложения почти всегда стартуют с main.go в пакете main
+            # Часто роуты выносят в router.go или routes.go
+            if name in {"main.go", "router.go", "routes.go", "server.go"}:
+                return True
+            return False
+
+        # --- Ruby (Ruby on Rails) ---
+        if self.lang == "ruby":
+            # config.ru - Rack entry point
+            # routes.rb - Rails routing definition (самое важное для анализа путей)
+            if name in {"config.ru", "routes.rb", "application.rb"}:
+                return True
+            return False
+
+        # --- Scala (Play Framework) ---
+        if self.lang == "scala":
+            # Play Framework хранит роуты в файле без расширения или .routes
+            if name == "routes" and "/conf/" in p:
+                return True
+            return False
+
+        # --- Rust (Actix, Rocket) ---
+        if self.lang == "rust":
+            if name == "main.rs":
                 return True
             return False
 
         return False
+
 
     # -----------------------------
     # PHP SOURCES detection
@@ -459,22 +519,120 @@ class CodeParser:
         txt = safe_text(content, def_node)
         low = txt.lower()
 
+        # --- Python (Flask, FastAPI, Django) ---
         if self.lang == "python":
-            if "@" not in txt:
-                return False
-            keys = [".route", " route", ".get", ".post", ".put", ".delete", ".patch", ".options", ".head", "websocket"]
-            return any(k in low for k in keys)
+            # Decorators: @app.route, @app.get, @router.post, etc.
+            if "@" in txt:
+                keys = [
+                    ".route", " route",  # Flask, generic
+                    ".get", ".post", ".put", ".delete", ".patch", ".options", ".head",  # FastAPI / Flask views
+                    "websocket"  # FastAPI/Starlette
+                ]
+                if any(k in low for k in keys):
+                    return True
+            
+            # Django patterns (urls.py): path('...', ...), re_path('...', ...)
+            if "path(" in low or "re_path(" in low:
+                return True
+            
+            return False
 
+        # --- JavaScript / TypeScript (Express, NestJS, Fastify) ---
+        if self.lang in ("javascript", "typescript", "javascriptreact", "typescriptreact"):
+            # Express.js / Fastify style: app.get(...), router.post(...)
+            call_patterns = [
+                "app.get(", "app.post(", "app.put(", "app.delete(", "app.patch(",
+                "router.get(", "router.post(", "router.put(", "router.delete(", "router.patch(",
+                "route(" # Generic
+            ]
+            if any(p in low for p in call_patterns):
+                return True
+            
+            # NestJS Decorators: @Get, @Post, @Controller, etc.
+            if "@" in txt:
+                nest_keys = ["@get", "@post", "@put", "@delete", "@patch", "@options", "@head", "@requestmapping"]
+                if any(k in low for k in nest_keys):
+                    return True
+                    
+            return False
+
+        # --- Java (Spring Boot) ---
         if self.lang == "java":
-            return any(a in low for a in ["@requestmapping", "@getmapping", "@postmapping", "@putmapping", "@deletemapping", "@patchmapping"])
+            # Spring Annotations
+            spring_annotations = [
+                "@requestmapping", "@getmapping", "@postmapping", 
+                "@putmapping", "@deletemapping", "@patchmapping"
+            ]
+            return any(a in low for a in spring_annotations)
 
+        # --- C# (ASP.NET Core) ---
         if self.lang == "c_sharp":
-            return any(a in low for a in ["[httpget", "[httppost", "[httpput", "[httpdelete", "[httppatch", "[route", "[acceptverbs"])
+            # Attributes: [HttpGet], [Route], etc.
+            attributes = [
+                "[httpget", "[httppost", "[httpput", "[httpdelete", "[httppatch", 
+                "[route", "[acceptverbs"
+            ]
+            if any(a in low for a in attributes):
+                return True
+            
+            # Minimal APIs: app.MapGet(...), app.MapPost(...)
+            map_patterns = [
+                ".mapget", ".mappost", ".mapput", ".mapdelete", ".mappatch", ".mapgroup"
+            ]
+            if any(m in low for m in map_patterns):
+                return True
+            
+            return False
 
+        # --- PHP (Laravel, Symfony) ---
         if self.lang == "php":
+            # PHP 8 Attributes (#[Route]) or Annotations (@Route)
             return ("#[route" in low) or ("@route" in low)
 
+        # --- Go (Gin, Echo, Stdlib) ---
+        if self.lang == "go":
+            # router.GET, app.POST, etc.
+            # Including dot to avoid matching variable names ending in get/post
+            go_patterns = [
+                ".get(", ".post(", ".put(", ".delete(", ".patch(", 
+                ".group(", ".handlefunc("
+            ]
+            return any(p in low for p in go_patterns)
+
+        # --- Rust (Actix-web, Rocket) ---
+        if self.lang == "rust":
+            # Attributes: #[get(...)], #[post(...)]
+            rust_attrs = ["#[get", "#[post", "#[put", "#[delete", "#[patch", "#[route"]
+            return any(a in low for a in rust_attrs)
+
+        # --- Ruby (Rails, Sinatra) ---
+        if self.lang == "ruby":
+            # Rails routes.rb often uses bare methods: get '...', post '...'
+            # We look for the pattern with quotes to be safer
+            ruby_patterns = [
+                "get '", 'get "', 
+                "post '", 'post "', 
+                "put '", 'put "', 
+                "delete '", 'delete "', 
+                "patch '", 'patch "',
+                "resources :"
+            ]
+            return any(p in low for p in ruby_patterns)
+
+        # --- Kotlin (Ktor) ---
+        if self.lang == "kotlin":
+            # DSL: get(...) { }, post(...) { }
+            # Often used inside routing { ... }
+            ktor_patterns = ["get(", "post(", "put(", "delete(", "patch(", "route("]
+            return any(p in low for p in ktor_patterns)
+
+        # --- R (Plumber) ---
+        if self.lang == "r":
+            # Special comments: #* @get, #* @post
+            return "#* @" in low and any(v in low for v in ["get", "post", "put", "delete"])
+
         return False
+
 
     # -----------------------------
     # Call extraction (graph edges)
