@@ -157,7 +157,8 @@ class LLMClient:
             "- \"vulnerability\": boolean (true if vulnerable, false otherwise)\n"
             "- \"confidence\": string (e.g., \"High\", \"Medium\", \"Low\")\n"
             "- \"reasoning\": string (explanation)\n"
-            "- \"fix\": string (suggested fix if applicable)\n"
+            "- \"exploit\": string (vulnerability exploitation method, request, or sequence of actions)\n"
+
         )
         context = self._extract_context(match, radius=10)
         user = (
