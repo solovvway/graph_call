@@ -8,6 +8,7 @@ import json
 import re
 import pathlib
 import shutil
+import random
 from pathlib import Path
 from typing import List, Dict, Optional, Set, Tuple
 from collections import defaultdict
@@ -26,9 +27,17 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 logger = logging.getLogger(__name__)
 
 class LLMClient:
-    """Thin wrapper around the Yandex LLM endpoint (Async version)."""
+    """Thin wrapper around the Yandex LLM endpoint (Async version) with rate limiting."""
 
-    def __init__(self, base_url: str, api_key: str, model: str = "gpt-4o-mini", temperature: float = 0.0, debug: bool = False):
+    # Default concurrency limit (Yandex allows 10 concurrent sessions, we use 5 to be safe)
+    DEFAULT_MAX_CONCURRENT = 8
+    # Retry settings for rate limiting
+    MAX_RETRIES = 5
+    BASE_DELAY = 1.0  # Base delay in seconds for exponential backoff
+    MAX_DELAY = 60.0  # Maximum delay between retries
+
+    def __init__(self, base_url: str, api_key: str, model: str = "gpt-4o-mini",
+                 temperature: float = 0.0, debug: bool = False, max_concurrent: int = None):
         """
         Initialise the LLM client.
 
@@ -39,43 +48,87 @@ class LLMClient:
         model: Model name to use (default: gpt-4o-mini).
         temperature: Sampling temperature (default: 0.0).
         debug: Enable debug logging.
+        max_concurrent: Maximum number of concurrent requests (default: 5).
         """
         print(f"[DEBUG] Initializing LLMClient: base_url={base_url}, model={model}, temperature={temperature}")
         self.client = openai.AsyncOpenAI(base_url=base_url, api_key=api_key)
         self.model = model
         self.temperature = temperature
         self.debug = debug
+        
+        # Semaphore for rate limiting concurrent requests
+        self._max_concurrent = max_concurrent or self.DEFAULT_MAX_CONCURRENT
+        self._semaphore = asyncio.Semaphore(self._max_concurrent)
+        logger.info(f"LLM rate limiter initialized: max {self._max_concurrent} concurrent requests")
+
+    async def _chat_with_retry(self, system_prompt: str, user_prompt: str) -> str:
+        """Send a chat request with exponential backoff retry on rate limit errors."""
+        
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                # Build the request payload.
+                payload = {
+                    "model": self.model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "temperature": self.temperature,
+                    "response_format": {"type": "json_object"}
+                }
+
+                # The OpenAI client expects the request parameters as keyword arguments.
+                response = await self.client.chat.completions.create(**payload)
+                content = response.choices[0].message.content.strip()
+                
+                if self.debug:
+                    print(f"\n[DEBUG] LLM Response:\n{content}")
+                    
+                return content
+                
+            except openai.RateLimitError as e:
+                # Handle 429 Too Many Requests with exponential backoff
+                if attempt < self.MAX_RETRIES - 1:
+                    # Calculate delay with exponential backoff and jitter
+                    delay = min(self.BASE_DELAY * (2 ** attempt) + random.uniform(0, 1), self.MAX_DELAY)
+                    logger.warning(f"Rate limit hit (attempt {attempt + 1}/{self.MAX_RETRIES}), waiting {delay:.2f}s...")
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(f"Rate limit exceeded after {self.MAX_RETRIES} retries: {e}")
+                    return json.dumps({"vulnerability": False, "error": f"Rate limit exceeded: {e}"})
+                    
+            except openai.APIStatusError as e:
+                if e.status_code == 429:
+                    # Handle 429 from APIStatusError as well
+                    if attempt < self.MAX_RETRIES - 1:
+                        delay = min(self.BASE_DELAY * (2 ** attempt) + random.uniform(0, 1), self.MAX_DELAY)
+                        logger.warning(f"Rate limit hit (attempt {attempt + 1}/{self.MAX_RETRIES}), waiting {delay:.2f}s...")
+                        await asyncio.sleep(delay)
+                    else:
+                        logger.error(f"Rate limit exceeded after {self.MAX_RETRIES} retries: {e}")
+                        return json.dumps({"vulnerability": False, "error": f"Rate limit exceeded: {e}"})
+                else:
+                    logger.error(f"API error: {e}")
+                    return json.dumps({"vulnerability": False, "error": str(e)})
+                    
+            except Exception as e:
+                logger.error(f"LLM request failed: {e}")
+                return json.dumps({"vulnerability": False, "error": str(e)})
+        
+        return json.dumps({"vulnerability": False, "error": "Max retries exceeded"})
 
     async def _chat(self, system_prompt: str, user_prompt: str) -> str:
-        """Send a single‑turn chat request and return the assistant's content."""
+        """Send a single‑turn chat request with rate limiting and return the assistant's content."""
         
         if self.debug:
             print(f"\n[DEBUG] System Prompt:\n{system_prompt}")
             print(f"\n[DEBUG] User Prompt:\n{user_prompt}")
 
-        # Build the request payload.
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": self.temperature,
-            "response_format": {"type": "json_object"}
-        }
-
-        try:
-            # The OpenAI client expects the request parameters as keyword arguments.
-            response = await self.client.chat.completions.create(**payload)
-            content = response.choices[0].message.content.strip()
-            
+        # Use semaphore to limit concurrent requests
+        async with self._semaphore:
             if self.debug:
-                print(f"\n[DEBUG] LLM Response:\n{content}")
-                
-            return content
-        except Exception as e:
-            print(f"[WARN] LLM request failed: {e}", file=sys.stderr)
-            return json.dumps({"vulnerability": False, "error": str(e)})
+                logger.debug(f"Acquired semaphore, making request...")
+            return await self._chat_with_retry(system_prompt, user_prompt)
 
     def _extract_context(self, match: dict, radius: int = 5) -> str:
         """
@@ -143,13 +196,25 @@ class LLMSecurityGraph(SecurityGraph):
         if not self.found_traces_paths:
             return
 
-        logger.info(f"Processing {len(self.found_traces_paths)} traces with LLM...")
+        total_traces = len(self.found_traces_paths)
+        logger.info(f"Processing {total_traces} traces with LLM (rate-limited)...")
         
+        # Create tasks - the semaphore in LLMClient will handle rate limiting
         tasks = []
         for path, trace_id in self.found_traces_paths:
             tasks.append(self._analyze_trace(path, trace_id))
         
-        await asyncio.gather(*tasks)
+        # Process all tasks - rate limiting is handled by the semaphore in LLMClient
+        # Using gather with return_exceptions=True to continue even if some fail
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Log any exceptions that occurred
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                trace_id = self.found_traces_paths[i][1]
+                logger.error(f"Trace {trace_id} analysis failed with exception: {result}")
+        
+        logger.info(f"Completed processing {total_traces} traces")
 
     async def _analyze_trace(self, path: List[str], trace_id: int):
         # Generate trace text
@@ -227,6 +292,7 @@ async def async_main():
     api_key = args.api_key
     model = args.model
     temperature = 0.0
+    max_concurrent = LLMClient.DEFAULT_MAX_CONCURRENT  # Default concurrency limit
 
     if args.config:
         config_path = Path(args.config).resolve()
@@ -238,6 +304,7 @@ async def async_main():
                     api_key = config.get("api_key", api_key)
                     model = config.get("model", model)
                     temperature = config.get("temperature", temperature)
+                    max_concurrent = config.get("max_concurrent", max_concurrent)
             except Exception as e:
                 print(f"Error loading config file: {e}")
                 sys.exit(1)
@@ -249,7 +316,8 @@ async def async_main():
         print("Error: API Key is required (via --api-key or --config)")
         sys.exit(1)
 
-    client = LLMClient(base_url=base_url, api_key=api_key, model=model, temperature=temperature, debug=args.debug)
+    client = LLMClient(base_url=base_url, api_key=api_key, model=model, temperature=temperature,
+                       debug=args.debug, max_concurrent=max_concurrent)
     graph = LLMSecurityGraph(client, reports_dir)
     
     # --- Graph Building (Copied from auditor.py) ---
