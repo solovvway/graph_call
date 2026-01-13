@@ -158,6 +158,7 @@ KNOWN_SINKS: Dict[str, Set[str]] = {
         "http.Get", "http.Post", "net.Dial", # SSRF
         "os.Remove", "os.WriteFile", # File System
         "http.Redirect", # Open Redirect
+        "fmt.Sprintf",
         "regexp.Compile", # ReDoS
     },
     "ruby": {
