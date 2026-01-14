@@ -1036,6 +1036,7 @@ class SecurityGraph:
         # Maps: code_hash -> (trace_id, path_set)
         # path_set contains all paths that share the same function code
         self._code_hash_to_file: Dict[str, Tuple[int, Set[Tuple[str, ...]]]] = {}
+        self._traces_found: int = 0  # Счетчик найденных trace'ов для прогресс-бара
 
     def add_node(self, n: Node):
         if n.uid in self.nodes:
@@ -1240,6 +1241,11 @@ class SecurityGraph:
         
         return None
 
+    def _path_to_short_string(self, path: List[str]) -> str:
+        """Генерирует краткую строку пути для вывода в консоль"""
+        names = [self._label(uid) for uid in path]
+        return f"[PATH] {' -> '.join(names)}"
+
     def _path_to_text(self, path: List[str], include_code: bool) -> str:
         out: List[str] = []
         names = [self._label(uid) for uid in path]
@@ -1273,9 +1279,17 @@ class SecurityGraph:
 
         return "\n".join(out)
 
+    def _update_progress(self):
+        """Обновляет прогресс-бар на месте"""
+        bar_length = 50
+        filled = min(bar_length, self._traces_found)
+        bar = "█" * filled + "░" * (bar_length - filled)
+        progress_text = f"\r[PROGRESS] [{bar}] Traces found: {self._traces_found}"
+        sys.stdout.write(progress_text)
+        sys.stdout.flush()
+
     def _emit_trace(self, path: List[str]):
-        # Console output
-        print(self._path_to_text(path, include_code=self.show_code))
+        self._traces_found += 1
 
         # File output with deduplication
         if self.out_dir:
@@ -1314,19 +1328,20 @@ class SecurityGraph:
                             encoding="utf-8", errors="ignore"
                         )
                     
-                    # Добавляем новый путь в файл с кодом
-                    if code_file.exists():
-                        existing_code_content = code_file.read_text(encoding="utf-8", errors="ignore")
-                        new_path_code = self._path_to_text(path, include_code=True)
-                        # Добавляем разделитель и новый путь
-                        updated_code_content = existing_code_content + "\n\n" + "="*80 + "\n\n" + new_path_code
-                        code_file.write_text(updated_code_content, encoding="utf-8", errors="ignore")
-                    else:
-                        # Если файл почему-то не существует, создаем заново
-                        code_file.write_text(
-                            self._path_to_text(path, include_code=True),
-                            encoding="utf-8", errors="ignore"
-                        )
+                    # Добавляем новый путь в файл с кодом (только если show_code=True)
+                    if self.show_code:
+                        if code_file.exists():
+                            existing_code_content = code_file.read_text(encoding="utf-8", errors="ignore")
+                            new_path_code = self._path_to_text(path, include_code=True)
+                            # Добавляем разделитель и новый путь
+                            updated_code_content = existing_code_content + "\n\n" + "="*80 + "\n\n" + new_path_code
+                            code_file.write_text(updated_code_content, encoding="utf-8", errors="ignore")
+                        else:
+                            # Если файл почему-то не существует, создаем заново
+                            code_file.write_text(
+                                self._path_to_text(path, include_code=True),
+                                encoding="utf-8", errors="ignore"
+                            )
                     
                     logger.debug(f"Added path to existing trace file {existing_trace_id} (code_hash: {code_hash[:8]}...)")
             else:
@@ -1343,10 +1358,15 @@ class SecurityGraph:
                     self._path_to_text(path, include_code=False),
                     encoding="utf-8", errors="ignore"
                 )
-                (self.out_dir / f"{trace_id}_code.txt").write_text(
-                    self._path_to_text(path, include_code=True),
-                    encoding="utf-8", errors="ignore"
-                )
+                # Сохраняем код в файл только если show_code=True
+                if self.show_code:
+                    (self.out_dir / f"{trace_id}_code.txt").write_text(
+                        self._path_to_text(path, include_code=True),
+                        encoding="utf-8", errors="ignore"
+                    )
+        
+        # Обновляем прогресс-бар (перезаписываем строку на месте)
+        self._update_progress()
 
     def _print_sink_summary(self, top: int = 20):
         sink_counts: Dict[str, int] = defaultdict(int)
@@ -1366,6 +1386,7 @@ class SecurityGraph:
     def trace_all(self, show_code: bool = False, out_dir: Optional[Path] = None):
         self.show_code = show_code
         self.out_dir = out_dir
+        self._traces_found = 0  # Сбрасываем счетчик
 
         print(f"\n{'='*30} VULNERABILITY REPORT {'='*30}")
         
@@ -1392,6 +1413,11 @@ class SecurityGraph:
         paths_found = 0
         max_depth = 16
 
+        # Инициализируем прогресс-бар
+        print("\n[PROGRESS] Analyzing traces...")
+        sys.stdout.write("[PROGRESS] [░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░] Traces found: 0\n")
+        sys.stdout.flush()
+
         def dfs(curr, path, visited_local):
             nonlocal paths_found
             if self.nodes[curr].is_sink:
@@ -1410,6 +1436,9 @@ class SecurityGraph:
             dfs(start_node, [start_node], {start_node})
         # ==================== ИЗМЕНЕНИЕ КОНЕЦ ====================
 
+        # Завершаем прогресс-бар (переходим на новую строку)
+        print()  # Новая строка после прогресс-бара
+
         if paths_found == 0:
             print("\n[INFO] No paths from WEB Entry Points or Sources to Sinks found.")
             print("Showing immediate callers of Sinks (Backward Trace):")
@@ -1420,6 +1449,7 @@ class SecurityGraph:
                     # Проверяем, что у вызывающей функции есть источник данных, чтобы не показывать совсем бесполезные пути
                     if self.nodes[c].is_source:
                        self._emit_trace([c, sink])
+                       print()  # Новая строка после последнего trace'а
 
     def visualize(self, filename="vuln_graph"):
         if not shutil.which("dot"):
@@ -1479,10 +1509,20 @@ def main():
 
     all_raw_edges: List[Tuple[Edge, str]] = []
 
+    # Подсчитываем общее количество файлов для прогресс-бара
+    total_files = sum(len(paths) for paths in files_map.values())
+    files_processed = 0
+
     for lang, paths in files_map.items():
         logger.info(f"Analyzing {len(paths)} {lang} files...")
         parser_eng = CodeParser(lang, repo_root=repo)
-        for p in paths:
+        
+        # Инициализируем прогресс-бар для текущего языка
+        if total_files > 0:
+            sys.stdout.write(f"\r[AST PROGRESS] [{'░' * 50}] Files parsed: {files_processed}/{total_files} ({lang})")
+            sys.stdout.flush()
+        
+        for idx, p in enumerate(paths):
             try:
                 content = p.read_bytes()
                 nodes, edges = parser_eng.parse_file(p, content)
@@ -1490,8 +1530,36 @@ def main():
                     graph.add_node(n)
                 for e in edges:
                     all_raw_edges.append((e, lang))
+                
+                files_processed += 1
+                
+                # Обновляем прогресс-бар
+                if total_files > 0:
+                    bar_length = 50
+                    filled = int((files_processed / total_files) * bar_length)
+                    filled = min(bar_length, filled)
+                    bar = "█" * filled + "░" * (bar_length - filled)
+                    percentage = int((files_processed / total_files) * 100)
+                    progress_text = f"\r[AST PROGRESS] [{bar}] Files parsed: {files_processed}/{total_files} ({percentage}%) - {lang}"
+                    sys.stdout.write(progress_text)
+                    sys.stdout.flush()
             except Exception as e:
                 logger.debug(f"Failed reading/parsing {p}: {e}")
+                files_processed += 1
+                # Обновляем прогресс-бар даже при ошибке
+                if total_files > 0:
+                    bar_length = 50
+                    filled = int((files_processed / total_files) * bar_length)
+                    filled = min(bar_length, filled)
+                    bar = "█" * filled + "░" * (bar_length - filled)
+                    percentage = int((files_processed / total_files) * 100)
+                    progress_text = f"\r[AST PROGRESS] [{bar}] Files parsed: {files_processed}/{total_files} ({percentage}%) - {lang}"
+                    sys.stdout.write(progress_text)
+                    sys.stdout.flush()
+    
+    # Завершаем прогресс-бар AST парсинга
+    if total_files > 0:
+        print()  # Новая строка после завершения прогресс-бара
 
     logger.info(f"Linking {len(all_raw_edges)} calls...")
     for e, lang in all_raw_edges:
