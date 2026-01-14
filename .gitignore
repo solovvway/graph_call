@@ -14,3 +14,4 @@ out
 repos
 __pycache__
 first-try
+*.txt

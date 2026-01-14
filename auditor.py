@@ -23,7 +23,7 @@ MODIFICATION:
   This allows finding vulnerabilities in files not directly linked from a main entry point.
 """
 
-import os, sys, logging, argparse, shutil, warnings, re
+import os, sys, logging, argparse, shutil, warnings, re, hashlib
 from pathlib import Path
 from typing import Dict, List, Set, Tuple, Optional, Iterable, DefaultDict
 from dataclasses import dataclass
@@ -152,7 +152,8 @@ KNOWN_SINKS: Dict[str, Set[str]] = {
         # Added from regex
         "exec.CommandContext", "syscall.Exec", # Command Injection
         "db.Query", "db.Exec", "db.Prepare", # SQLi
-        "json.Unmarshal", "xml.Unmarshal", "gob.Decode", # Deserialization
+        "json.Unmarshal", 
+        "xml.Unmarshal", "gob.Decode", # Deserialization
         "template.ExecuteTemplate", "pongo2.FromString", # SSTI
         "xml.NewDecoder", # XXE
         "http.Get", "http.Post", "net.Dial", # SSRF
@@ -1030,6 +1031,11 @@ class SecurityGraph:
         self.out_dir: Optional[Path] = None
         self._trace_counter: int = 0
         self._file_text_cache: Dict[str, List[str]] = {}
+        
+        # Deduplication: track files by code hash (excluding sink)
+        # Maps: code_hash -> (trace_id, path_set)
+        # path_set contains all paths that share the same function code
+        self._code_hash_to_file: Dict[str, Tuple[int, Set[Tuple[str, ...]]]] = {}
 
     def add_node(self, n: Node):
         if n.uid in self.nodes:
@@ -1147,6 +1153,93 @@ class SecurityGraph:
         snippet = lines[start - 1:end]
         return "\n".join(snippet)
 
+    def _get_path_code_hash(self, path: List[str]) -> str:
+        """
+        Вычисляет хеш кода всех функций в пути (исключая sink).
+        Используется для дедупликации файлов с одинаковым кодом.
+        """
+        if not path:
+            return ""
+        
+        # Исключаем sink из хеша, так как sinks могут быть разными
+        # Берем все функции кроме последней (sink)
+        function_uids = path[:-1] if len(path) > 1 else []
+        
+        if not function_uids:
+            return ""
+        
+        # Собираем код всех функций
+        codes = []
+        for uid in function_uids:
+            code = self._node_code(uid)
+            if code:
+                codes.append(f"{uid}:{code}")
+        
+        # Создаем хеш из отсортированного списка кодов
+        # Сортируем для консистентности
+        combined = "\n---\n".join(sorted(codes))
+        return hashlib.md5(combined.encode('utf-8')).hexdigest()
+
+    def _get_functions_code_set(self, path: List[str]) -> Set[str]:
+        """
+        Возвращает множество хешей кода функций в пути (исключая sink).
+        Используется для проверки, является ли путь расширением существующего.
+        """
+        if not path or len(path) <= 1:
+            return set()
+        
+        # Исключаем sink
+        function_uids = path[:-1]
+        code_hashes = set()
+        
+        for uid in function_uids:
+            code = self._node_code(uid)
+            if code:
+                # Создаем хеш для каждой функции отдельно
+                code_hash = hashlib.md5(f"{uid}:{code}".encode('utf-8')).hexdigest()
+                code_hashes.add(code_hash)
+        
+        return code_hashes
+
+    def _find_existing_file_for_path(self, path: List[str]) -> Optional[Tuple[int, List[str]]]:
+        """
+        Ищет существующий файл для данного пути на основе кода функций.
+        Возвращает (trace_id, existing_path) если:
+        1. Найден файл с точно таким же кодом функций (хеш совпадает), или
+        2. Новый путь содержит все функции из существующего пути (является расширением).
+        Sink может быть разным - это нормально.
+        """
+        code_hash = self._get_path_code_hash(path)
+        if not code_hash:
+            # Если нет кода функций (только sink), создаем отдельный файл
+            return None
+        
+        # Сначала проверяем точное совпадение хеша
+        if code_hash in self._code_hash_to_file:
+            trace_id, existing_paths = self._code_hash_to_file[code_hash]
+            if existing_paths:
+                first_path = list(next(iter(existing_paths)))
+                return (trace_id, first_path)
+        
+        # Если точного совпадения нет, проверяем, является ли новый путь расширением существующего
+        # (содержит все функции из существующего пути + еще)
+        new_functions_set = self._get_functions_code_set(path)
+        if not new_functions_set:
+            return None
+        
+        # Проверяем все существующие файлы
+        for existing_hash, (trace_id, existing_paths) in self._code_hash_to_file.items():
+            # Берем первый путь из существующих для проверки
+            if existing_paths:
+                existing_path = list(next(iter(existing_paths)))
+                existing_functions_set = self._get_functions_code_set(existing_path)
+                
+                # Если новый путь содержит все функции из существующего (является расширением)
+                if existing_functions_set and existing_functions_set.issubset(new_functions_set):
+                    return (trace_id, existing_path)
+        
+        return None
+
     def _path_to_text(self, path: List[str], include_code: bool) -> str:
         out: List[str] = []
         names = [self._label(uid) for uid in path]
@@ -1181,24 +1274,79 @@ class SecurityGraph:
         return "\n".join(out)
 
     def _emit_trace(self, path: List[str]):
-        self._trace_counter += 1
-        trace_id = self._trace_counter
-
         # Console output
         print(self._path_to_text(path, include_code=self.show_code))
 
-        # File output
+        # File output with deduplication
         if self.out_dir:
             self.out_dir.mkdir(parents=True, exist_ok=True)
-
-            (self.out_dir / f"{trace_id}.txt").write_text(
-                self._path_to_text(path, include_code=False),
-                encoding="utf-8", errors="ignore"
-            )
-            (self.out_dir / f"{trace_id}_code.txt").write_text(
-                self._path_to_text(path, include_code=True),
-                encoding="utf-8", errors="ignore"
-            )
+            
+            code_hash = self._get_path_code_hash(path)
+            
+            # Проверяем, есть ли уже файл с таким же кодом функций
+            existing = self._find_existing_file_for_path(path)
+            
+            if existing:
+                # Найден существующий файл - добавляем новый путь в него
+                existing_trace_id, existing_path = existing
+                path_tuple = tuple(path)
+                
+                # Обновляем множество путей для этого хеша
+                if code_hash in self._code_hash_to_file:
+                    trace_id, existing_paths = self._code_hash_to_file[code_hash]
+                    existing_paths.add(path_tuple)
+                    
+                    # Читаем существующий файл и добавляем новый путь
+                    txt_file = self.out_dir / f"{existing_trace_id}.txt"
+                    code_file = self.out_dir / f"{existing_trace_id}_code.txt"
+                    
+                    # Добавляем новый путь в текстовый файл
+                    if txt_file.exists():
+                        existing_content = txt_file.read_text(encoding="utf-8", errors="ignore")
+                        new_path_text = self._path_to_text(path, include_code=False)
+                        # Добавляем разделитель и новый путь
+                        updated_content = existing_content + "\n\n" + "="*80 + "\n\n" + new_path_text
+                        txt_file.write_text(updated_content, encoding="utf-8", errors="ignore")
+                    else:
+                        # Если файл почему-то не существует, создаем заново
+                        txt_file.write_text(
+                            self._path_to_text(path, include_code=False),
+                            encoding="utf-8", errors="ignore"
+                        )
+                    
+                    # Добавляем новый путь в файл с кодом
+                    if code_file.exists():
+                        existing_code_content = code_file.read_text(encoding="utf-8", errors="ignore")
+                        new_path_code = self._path_to_text(path, include_code=True)
+                        # Добавляем разделитель и новый путь
+                        updated_code_content = existing_code_content + "\n\n" + "="*80 + "\n\n" + new_path_code
+                        code_file.write_text(updated_code_content, encoding="utf-8", errors="ignore")
+                    else:
+                        # Если файл почему-то не существует, создаем заново
+                        code_file.write_text(
+                            self._path_to_text(path, include_code=True),
+                            encoding="utf-8", errors="ignore"
+                        )
+                    
+                    logger.debug(f"Added path to existing trace file {existing_trace_id} (code_hash: {code_hash[:8]}...)")
+            else:
+                # Новый уникальный код - создаем новый файл
+                self._trace_counter += 1
+                trace_id = self._trace_counter
+                
+                # Сохраняем хеш для будущих проверок
+                if code_hash:
+                    path_tuple = tuple(path)
+                    self._code_hash_to_file[code_hash] = (trace_id, {path_tuple})
+                
+                (self.out_dir / f"{trace_id}.txt").write_text(
+                    self._path_to_text(path, include_code=False),
+                    encoding="utf-8", errors="ignore"
+                )
+                (self.out_dir / f"{trace_id}_code.txt").write_text(
+                    self._path_to_text(path, include_code=True),
+                    encoding="utf-8", errors="ignore"
+                )
 
     def _print_sink_summary(self, top: int = 20):
         sink_counts: Dict[str, int] = defaultdict(int)
