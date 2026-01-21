@@ -1,27 +1,4 @@
 #!/usr/bin/env python3
-"""
-ASCG - WEB EntryPoints + PHP Sources + accurate PHP require/include detection + sink callsite counting
-
-Fixes requested:
-- JS kept as-is (works well).
-- PHP fixed so require/include occurrences are NOT collapsed:
-  Previously adjacency used sets, so many "require_once" from the same <global> collapsed into 1 edge,
-  producing "few findings". Now we keep per-callsite locations.
-- PHP require/include extraction is now robust:
-  - Tree-sitter AST scan (if node types exist)
-  - PLUS regex fallback (with comment stripping) to catch grammar/version differences.
-- Report now includes: total sink callsites and per-sink counts across repository,
-  not only reachable paths from WEB entrypoints.
-
-NEW requested features:
-- --code : for each function in each trace, show its code snippet as well (in console output).
-- --out DIR : save all traces and code traces:
-    DIR/1.txt, DIR/1_code.txt, DIR/2.txt, DIR/2_code.txt, ...
-
-MODIFICATION:
-- trace_all now starts from ALL sources (e.g. $_GET in a file), not just WEB_ENTRY points.
-  This allows finding vulnerabilities in files not directly linked from a main entry point.
-"""
 
 import os, sys, logging, argparse, shutil, warnings, re, hashlib
 from pathlib import Path
