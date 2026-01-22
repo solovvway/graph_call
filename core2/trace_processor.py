@@ -7,7 +7,7 @@ from typing import Dict, List, Set, Tuple, Optional, DefaultDict
 from collections import defaultdict
 import logging
 
-from ast_core import Node
+from .ast_core import Node
 
 logger = logging.getLogger(__name__)
 

@@ -6,9 +6,9 @@ from typing import Dict, List, Set, Tuple, Optional, DefaultDict
 from collections import defaultdict
 import logging
 
-from ast_core import Node, Edge, normalize_callee
-from sinks import KNOWN_SINKS
-from trace_processor import TraceProcessor
+from .ast_core import Node, Edge, normalize_callee
+from .sinks import KNOWN_SINKS
+from .trace_processor import TraceProcessor
 
 logger = logging.getLogger(__name__)
 

@@ -2,7 +2,7 @@
 
 import os, sys, logging, argparse, warnings
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 from collections import defaultdict
 
 warnings.simplefilter(action="ignore", category=FutureWarning)
@@ -17,10 +17,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 logger = logging.getLogger(__name__)
 
 # Import modular components
-from ast_core import CodeParser, EXT_TO_LANG
-from graph_builder import SecurityGraph
-from sinks import KNOWN_SINKS
-from sources import is_php_source
+from core2.ast_core import CodeParser, EXT_TO_LANG
+from core2.graph_builder import SecurityGraph
+from core2.sinks import KNOWN_SINKS
+from core2.sources import is_php_source
 
 def main():
     ap = argparse.ArgumentParser()
