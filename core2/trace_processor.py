@@ -22,6 +22,11 @@ class TraceProcessor:
         # Maps: code_hash -> (trace_id, path_set)
         # path_set contains all paths that share the same function code
         self._code_hash_to_file: Dict[str, Tuple[int, Set[Tuple[str, ...]]]] = {}
+        
+        # Store function code separately to avoid duplication
+        # Maps: trace_id -> {uid: code}
+        self._trace_code_cache: Dict[int, Dict[str, str]] = {}
+        
         self._traces_found: int = 0  # Счетчик найденных trace'ов для прогресс-бара
 
     def _get_file_lines(self, file_path: str) -> List[str]:
@@ -145,7 +150,6 @@ class TraceProcessor:
     def _label(self, uid: str, nodes: Dict[str, Node]) -> str:
         n = nodes[uid]
         tags = []
-        if n.is_entry: tags.append("WEB_ENTRY")
         if n.is_source: tags.append("SOURCE")
         if n.is_sink: tags.append("SINK")
         return f"{n.name}" + (f" [{'|'.join(tags)}]" if tags else "")
@@ -162,38 +166,81 @@ class TraceProcessor:
             loc = f"{n.file}:{n.line}-{n.end_line}"
         return loc
 
-    def _path_to_text(self, path: List[str], nodes: Dict[str, Node], edge_sites: DefaultDict[Tuple[str, str], List[Tuple[str, int]]], include_code: bool) -> str:
+    def _path_to_yaml(self, path: List[str], nodes: Dict[str, Node], edge_sites: DefaultDict[Tuple[str, str], List[Tuple[str, int]]], code_cache: Optional[Dict[str, str]] = None, indent: int = 0, show_code: bool = True) -> str:
+        """Generate YAML representation of path with nested function calls.
+        
+        Args:
+            show_code: If False, skip code blocks even if code_cache is provided
+        """
+        if not path:
+            return ""
+        
         out: List[str] = []
-        names = [self._label(uid, nodes) for uid in path]
-        out.append(f"[PATH] {' -> '.join(names)}")
-        out.append("")
-
-        for uid in path:
-            n = nodes[uid]
-            out.append(f"{self._label(uid, nodes)} ({self._format_loc(n)})")
-            if include_code:
-                code = self._node_code(nodes, uid)
-                if code:
-                    out.append("----- CODE BEGIN -----")
-                    out.append(code)
-                    out.append("----- CODE END -----")
-            out.append("")
-
-        # callsites for each hop
-        if len(path) >= 2:
-            out.append("callsites:")
-            for i in range(len(path) - 1):
-                src, dst = path[i], path[i + 1]
-                sites = edge_sites.get((src, dst), [])
-                if not sites:
-                    continue
-                uniq = list(dict.fromkeys(sites))[:20]
-                out.append(f"  {self._label(src, nodes)} -> {self._label(dst, nodes)}")
+        indent_str = "  " * indent
+        
+        # Process first function in path
+        uid = path[0]
+        n = nodes[uid]
+        label = self._label(uid, nodes)
+        loc = self._format_loc(n)
+        
+        # Build YAML entry for current function
+        # Escape special YAML characters in label and loc
+        label_escaped = label.replace('"', '\\"').replace(':', '\\:')
+        loc_escaped = loc.replace('"', '\\"').replace(':', '\\:')
+        
+        # Use quotes if label contains special characters
+        if any(c in label for c in ['[', ']', ':', '"', "'", '&', '*', '?', '|', '-', '<', '>', '=', '!', '%', '@', '`']):
+            out.append(f'{indent_str}- function: "{label_escaped}"')
+        else:
+            out.append(f"{indent_str}- function: {label}")
+        
+        if any(c in loc for c in ['[', ']', ':', '"', "'", '&', '*', '?', '|', '-', '<', '>', '=', '!', '%', '@', '`']):
+            out.append(f'{indent_str}  location: "{loc_escaped}"')
+        else:
+            out.append(f"{indent_str}  location: {loc}")
+        
+        # Add tags if present
+        tags = []
+        if n.is_source:
+            tags.append("SOURCE")
+        if n.is_sink:
+            tags.append("SINK")
+        if tags:
+            out.append(f"{indent_str}  tags: [{', '.join(tags)}]")
+        
+        # Add code if available and show_code is True
+        if show_code and code_cache and uid in code_cache:
+            code = code_cache[uid]
+            if code:
+                # Escape code for YAML (use literal block scalar)
+                code_lines = code.split('\n')
+                out.append(f"{indent_str}  code: |")
+                for line in code_lines:
+                    out.append(f"{indent_str}    {line}")
+        
+        # If there are more functions in path, add them as nested calls
+        if len(path) > 1:
+            # Add callsites for the call to next function
+            dst = path[1]
+            sites = edge_sites.get((uid, dst), [])
+            if sites:
+                uniq = list(dict.fromkeys(sites))[:10]  # Limit to 10 callsites
+                out.append(f"{indent_str}  callsites:")
                 for f, ln in uniq:
-                    out.append(f"    - {f}:{ln}")
-            out.append("")
-
+                    out.append(f"{indent_str}    - {f}:{ln}")
+            
+            # Recursively add next function(s) as nested calls
+            out.append(f"{indent_str}  calls:")
+            nested = self._path_to_yaml(path[1:], nodes, edge_sites, code_cache, indent + 1, show_code=show_code)
+            if nested:
+                out.append(nested)
+        
         return "\n".join(out)
+    
+    def _path_to_text(self, path: List[str], nodes: Dict[str, Node], edge_sites: DefaultDict[Tuple[str, str], List[Tuple[str, int]]], code_cache: Optional[Dict[str, str]] = None, show_code: bool = True) -> str:
+        """Generate YAML representation of path."""
+        return self._path_to_yaml(path, nodes, edge_sites, code_cache, indent=0, show_code=show_code)
 
     def _update_progress(self):
         """Обновляет прогресс-бар на месте"""
@@ -213,6 +260,15 @@ class TraceProcessor:
             
             code_hash = self._get_path_code_hash(path, nodes)
             
+            # Build code cache for this path (only for functions, not sinks)
+            code_cache: Dict[str, str] = {}
+            if self.show_code:
+                for uid in path:
+                    if uid not in code_cache:
+                        code = self._node_code(nodes, uid)
+                        if code:
+                            code_cache[uid] = code
+            
             # Проверяем, есть ли уже файл с таким же кодом функций
             existing = self._find_existing_file_for_path(path, nodes)
             
@@ -226,38 +282,53 @@ class TraceProcessor:
                     trace_id, existing_paths = self._code_hash_to_file[code_hash]
                     existing_paths.add(path_tuple)
                     
+                    # Обновляем кэш кода - добавляем только новые функции
+                    if existing_trace_id in self._trace_code_cache:
+                        existing_code_cache = self._trace_code_cache[existing_trace_id]
+                        # Добавляем только код функций, которых еще нет
+                        for uid, code in code_cache.items():
+                            if uid not in existing_code_cache:
+                                existing_code_cache[uid] = code
+                    else:
+                        self._trace_code_cache[existing_trace_id] = code_cache.copy()
+                    
                     # Читаем существующий файл и добавляем новый путь
                     txt_file = self.out_dir / f"{existing_trace_id}.txt"
                     code_file = self.out_dir / f"{existing_trace_id}_code.txt"
                     
-                    # Добавляем новый путь в текстовый файл
+                    # Получаем полный кэш кода для этого trace
+                    full_code_cache = self._trace_code_cache.get(existing_trace_id, {})
+                    
+                    # Добавляем новый путь в текстовый файл (без кода)
                     if txt_file.exists():
                         existing_content = txt_file.read_text(encoding="utf-8", errors="ignore")
-                        new_path_text = self._path_to_text(path, nodes, edge_sites, include_code=False)
+                        new_path_text = self._path_to_text(path, nodes, edge_sites, code_cache=None, show_code=False)
                         # Добавляем разделитель и новый путь
-                        updated_content = existing_content + "\n\n" + "="*80 + "\n\n" + new_path_text
+                        updated_content = existing_content + "\n\n---\n\n" + new_path_text
                         txt_file.write_text(updated_content, encoding="utf-8", errors="ignore")
                     else:
                         # Если файл почему-то не существует, создаем заново
                         txt_file.write_text(
-                            self._path_to_text(path, nodes, edge_sites, include_code=False),
+                            self._path_to_text(path, nodes, edge_sites, code_cache=None, show_code=False),
                             encoding="utf-8", errors="ignore"
                         )
                     
-                    # Добавляем новый путь в файл с кодом (только если show_code=True)
+                    # Обновляем файл с кодом (только если show_code=True)
+                    # Для первого пути показываем код, для остальных - только структуру
                     if self.show_code:
-                        if code_file.exists():
-                            existing_code_content = code_file.read_text(encoding="utf-8", errors="ignore")
-                            new_path_code = self._path_to_text(path, nodes, edge_sites, include_code=True)
-                            # Добавляем разделитель и новый путь
-                            updated_code_content = existing_code_content + "\n\n" + "="*80 + "\n\n" + new_path_code
-                            code_file.write_text(updated_code_content, encoding="utf-8", errors="ignore")
-                        else:
-                            # Если файл почему-то не существует, создаем заново
-                            code_file.write_text(
-                                self._path_to_text(path, nodes, edge_sites, include_code=True),
-                                encoding="utf-8", errors="ignore"
+                        all_paths = list(existing_paths)
+                        all_paths_text = []
+                        for idx, p in enumerate(all_paths):
+                            # Первый путь - с кодом, остальные - без кода
+                            show_code_for_path = (idx == 0)
+                            all_paths_text.append(
+                                self._path_to_text(list(p), nodes, edge_sites, code_cache=full_code_cache, show_code=show_code_for_path)
                             )
+                        
+                        code_file.write_text(
+                            "\n\n---\n\n".join(all_paths_text),
+                            encoding="utf-8", errors="ignore"
+                        )
                     
                     logger.debug(f"Added path to existing trace file {existing_trace_id} (code_hash: {code_hash[:8]}...)")
             else:
@@ -270,14 +341,20 @@ class TraceProcessor:
                     path_tuple = tuple(path)
                     self._code_hash_to_file[code_hash] = (trace_id, {path_tuple})
                 
+                # Сохраняем кэш кода
+                if self.show_code:
+                    self._trace_code_cache[trace_id] = code_cache.copy()
+                
+                # Создаем файл без кода
                 (self.out_dir / f"{trace_id}.txt").write_text(
-                    self._path_to_text(path, nodes, edge_sites, include_code=False),
+                    self._path_to_text(path, nodes, edge_sites, code_cache=None),
                     encoding="utf-8", errors="ignore"
                 )
-                # Сохраняем код в файл только если show_code=True
+                
+                # Создаем файл с кодом только если show_code=True
                 if self.show_code:
                     (self.out_dir / f"{trace_id}_code.txt").write_text(
-                        self._path_to_text(path, nodes, edge_sites, include_code=True),
+                        self._path_to_text(path, nodes, edge_sites, code_cache=code_cache),
                         encoding="utf-8", errors="ignore"
                     )
         

@@ -33,7 +33,6 @@ class SecurityGraph:
     def add_node(self, n: Node):
         if n.uid in self.nodes:
             old = self.nodes[n.uid]
-            old.is_entry = old.is_entry or n.is_entry
             old.is_sink = old.is_sink or n.is_sink
             old.is_source = old.is_source or n.is_source
 
@@ -114,67 +113,48 @@ class SecurityGraph:
 
         print(f"\n{'='*30} VULNERABILITY REPORT {'='*30}")
         
-        # ==================== ИЗМЕНЕНИЕ НАЧАЛО ====================
-        # Используем множества для автоматической дедупликации
-        entries = {uid for uid, n in self.nodes.items() if n.is_entry}
         sources = {uid for uid, n in self.nodes.items() if n.is_source}
         
-        print(f"Total Nodes: {len(self.nodes)} | WEB Entry Points: {len(entries)} | Sources: {len(sources)} | Sink Nodes: {len(self.sinks_found)}")
+        print(f"Total Nodes: {len(self.nodes)} | Sources: {len(sources)} | Sink Nodes: {len(self.sinks_found)}")
         self._print_sink_summary(top=30)
-
-        # Объединяем точки входа и источники данных в единый список стартовых точек для трассировки
-        start_points = entries | sources
-        # ==================== ИЗМЕНЕНИЕ КОНЕЦ ====================
 
         if not self.sinks_found:
             print("No dangerous sinks detected.")
             return
 
-        if not start_points:
-            print("\n[WARN] No WEB entrypoints or data Sources found. Unable to start trace.")
-            # Даже если нет стартовых точек, все равно покажем обратную трассировку от синков
-        
         paths_found = 0
-        max_depth = 16
 
         # Инициализируем прогресс-бар
-        print("\n[PROGRESS] Analyzing traces...")
+        print("\n[PROGRESS] Analyzing backward traces from sinks...")
         import sys
         sys.stdout.write("[PROGRESS] [░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░] Traces found: 0\n")
         sys.stdout.flush()
 
-        def dfs(curr, path, visited_local):
+        def dfs_backward(curr, path, visited_local):
+            """Backward DFS from sink upward through callers."""
             nonlocal paths_found
-            if self.nodes[curr].is_sink:
+            
+            # Emit trace if we have a path with at least sink + one caller
+            if len(path) > 1:
                 paths_found += 1
-                self.trace_processor.emit_trace(path, self.nodes, self.edge_sites)
-                return
-            if len(path) > max_depth:
-                return
-            for neighbor in self.adj.get(curr, []):
-                if neighbor not in visited_local:
-                    dfs(neighbor, path + [neighbor], visited_local | {neighbor})
+                # Reverse path so it goes from caller to sink (source to sink order)
+                reversed_path = list(reversed(path))
+                self.trace_processor.emit_trace(reversed_path, self.nodes, self.edge_sites)
+            
+            # Continue upward through callers (no depth limit)
+            for caller in self.rev_adj.get(curr, []):
+                if caller not in visited_local:
+                    dfs_backward(caller, path + [caller], visited_local | {caller})
 
-        # ==================== ИЗМЕНЕНИЕ НАЧАЛО ====================
-        # Запускаем трассировку от ВСЕХ стартовых точек (entry points + sources)
-        for start_node in start_points:
-            dfs(start_node, [start_node], {start_node})
-        # ==================== ИЗМЕНЕНИЕ КОНЕЦ ====================
+        # Start backward tracing from each sink
+        for sink_uid in sorted(self.sinks_found):
+            dfs_backward(sink_uid, [sink_uid], {sink_uid})
 
         # Завершаем прогресс-бар (переходим на новую строку)
         print()  # Новая строка после прогресс-бара
 
         if paths_found == 0:
-            print("\n[INFO] No paths from WEB Entry Points or Sources to Sinks found.")
-            print("Showing immediate callers of Sinks (Backward Trace):")
-            for sink in sorted(self.sinks_found):
-                callers = list(self.rev_adj.get(sink, []))
-                # Покажем хотя бы один пример вызова для каждого "осиротевшего" синка
-                for c in callers[:1]:
-                    # Проверяем, что у вызывающей функции есть источник данных, чтобы не показывать совсем бесполезные пути
-                    if self.nodes[c].is_source:
-                       self.trace_processor.emit_trace([c, sink], self.nodes, self.edge_sites)
-                       print()  # Новая строка после последнего trace'а
+            print("\n[INFO] No backward traces found from sinks.")
 
     def visualize(self, filename="vuln_graph"):
         if not shutil.which("dot"):
@@ -188,8 +168,6 @@ class SecurityGraph:
             for uid, n in self.nodes.items():
                 if n.is_sink:
                     dot.node(uid, label=f"{n.name}\n(SINK)", style="filled", fillcolor="#ffcccc", color="red")
-                elif n.is_entry:
-                    dot.node(uid, label=f"{n.name}\n(WEB ENTRY)", style="filled", fillcolor="#ccffcc")
                 elif n.is_source:
                     dot.node(uid, label=f"{n.name}\n(SOURCE)", style="filled", fillcolor="#fff2b2")
                 elif not n.is_builtin:

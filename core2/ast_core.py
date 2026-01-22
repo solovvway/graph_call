@@ -78,6 +78,14 @@ LANG_SPECS: Dict[str, Dict] = {
             "(call function: (identifier) @callee_expr) @call",
             "(call function: (attribute) @callee_expr) @call",
         ],
+        "string_concat_queries": [
+            # f-strings (f"...")
+            "(string) @fstring",
+            # % formatting ("..." % ...)
+            "(binary_operator operator: \"%\" left: (string) @left) @modulo",
+            # + operator (string concatenation)
+            "(binary_operator operator: \"+\" left: (_) right: (_)) @concat",
+        ],
     },
 
     "javascript": {
@@ -93,6 +101,12 @@ LANG_SPECS: Dict[str, Dict] = {
             "(call_expression function: (identifier) @callee_expr) @call",
             "(call_expression function: (member_expression) @callee_expr) @call",
             "(call_expression function: (optional_chain) @callee_expr) @call",
+        ],
+        "string_concat_queries": [
+            # Template literals (`...${...}...`)
+            "(template_string) @template",
+            # + operator (string concatenation)
+            "(binary_expression operator: \"+\" left: (_) right: (_)) @concat",
         ],
     },
 
@@ -110,6 +124,10 @@ LANG_SPECS: Dict[str, Dict] = {
             "(method_invocation name: (identifier) @callee_expr) @call",
             "(method_invocation object: (_) name: (identifier) @callee_expr) @call",
         ],
+        "string_concat_queries": [
+            # + operator (string concatenation)
+            "(binary_expression operator: \"+\" left: (_) right: (_)) @concat",
+        ],
     },
 
     "go": {
@@ -122,6 +140,10 @@ LANG_SPECS: Dict[str, Dict] = {
         "call_queries": [
             "(call_expression function: (identifier) @callee_expr) @call",
             "(call_expression function: (selector_expression) @callee_expr) @call",
+        ],
+        "string_concat_queries": [
+            # + operator (string concatenation)
+            "(binary_expression operator: \"+\" left: (_) right: (_)) @concat",
         ],
     },
 
@@ -137,6 +159,12 @@ LANG_SPECS: Dict[str, Dict] = {
             "(member_call_expression name: (name) @callee_expr) @call",
             "(scoped_call_expression name: (name) @callee_expr) @call",
         ],
+        "string_concat_queries": [
+            # . operator (string concatenation in PHP)
+            "(binary_expression operator: \".\" left: (_) right: (_)) @concat",
+            # + operator (also used for string concatenation)
+            "(binary_expression operator: \"+\" left: (_) right: (_)) @concat",
+        ],
     },
 
     "ruby": {
@@ -149,6 +177,12 @@ LANG_SPECS: Dict[str, Dict] = {
         "call_queries": [
             "(call method: (identifier) @callee_expr) @call",
             "(call method: (constant) @callee_expr) @call",
+        ],
+        "string_concat_queries": [
+            # String interpolation (#{...})
+            "(string (interpolation) @interpolated) @string_interp",
+            # + operator (string concatenation)
+            "(binary operator: \"+\" left: (_) right: (_)) @concat",
         ],
     },
 
@@ -163,6 +197,12 @@ LANG_SPECS: Dict[str, Dict] = {
         "call_queries": [
             "(invocation_expression expression: (identifier) @callee_expr) @call",
             "(invocation_expression expression: (member_access_expression) @callee_expr) @call",
+        ],
+        "string_concat_queries": [
+            # $ interpolation ($"...")
+            "(interpolated_string_expression) @interpolated",
+            # + operator (string concatenation)
+            "(binary_expression operator: \"+\" left: (_) right: (_)) @concat",
         ],
     },
 }
@@ -217,7 +257,6 @@ class CodeParser:
         # Always create <global> node (crucial for PHP/Node)
         nodes: List[Node] = []
         global_uid = f"{module_id}.<global>"
-        global_is_entry = self._is_web_global_entry_file(path)
         global_is_source = self._is_php_source_text(content.decode("utf-8", "ignore")) if self.lang == "php" else False
         file_end_line = content.count(b"\n") + 1
 
@@ -227,23 +266,22 @@ class CodeParser:
             file=str(path),
             line=1,
             end_line=file_end_line,
-            is_entry=global_is_entry,
             is_source=global_is_source
         ))
 
         # Regular functions/methods
         nodes.extend(self._extract_functions(tree, path, content, module_id))
 
+        # Extract anonymous functions from route registrations (for graph building, not entry marking)
+        nodes.extend(self._extract_route_handlers(tree, path, content, module_id))
+
         # Calls (edges)
         edges = self._extract_calls(tree, path, content, module_id)
 
-        # Mark WEB entrypoints by route registrations / controller annotations
-        entry_uids = self._extract_web_entrypoints(tree, path, content, module_id, nodes)
-        if entry_uids:
-            by_uid = {n.uid: n for n in nodes}
-            for uid in entry_uids:
-                if uid in by_uid:
-                    by_uid[uid].is_entry = True
+        # String concatenations (sinks)
+        concat_nodes, concat_edges = self._extract_string_concats(tree, path, content, module_id)
+        nodes.extend(concat_nodes)
+        edges.extend(concat_edges)
 
         return nodes, edges
 
@@ -283,56 +321,6 @@ class CodeParser:
         return f"{module_id}.{name}"
 
     # -----------------------------
-    # Web-entry helpers
-    # -----------------------------
-    def _is_web_global_entry_file(self, path: Path) -> bool:
-        name = path.name.lower()
-        p = str(path).replace("\\", "/").lower()
-
-        if self.lang == "python":
-            if name in {"app.py", "main.py", "server.py", "urls.py", "wsgi.py", "asgi.py", "routes.py"}:
-                return True
-            return False
-
-        if self.lang in {"javascript", "typescript", "javascriptreact", "typescriptreact", "tsx"}:
-            if name in {"app.js", "server.js", "index.js", "main.js", "app.ts", "server.ts", "index.ts", "main.ts"}:
-                return True
-            if name in {"routes.js", "router.js", "routes.ts", "router.ts"}:
-                return True
-            if name in {"page.tsx", "page.js", "_app.js", "_app.tsx", "layout.tsx"}:
-                return True
-            return False
-
-        if self.lang == "php":
-            if name == "index.php":
-                return True
-            if "/routes/" in p and name in {"web.php", "api.php", "routes.php"}:
-                return True
-            return False
-
-        if self.lang == "c_sharp":
-            if name in {"program.cs", "startup.cs"}:
-                return True
-            return False
-
-        if self.lang == "java":
-            if name in {"application.java", "main.java", "webconfig.java"}:
-                return True
-            return False
-
-        if self.lang == "go":
-            if name in {"main.go", "router.go", "routes.go", "server.go"}:
-                return True
-            return False
-
-        if self.lang == "ruby":
-            if name in {"config.ru", "routes.rb", "application.rb"}:
-                return True
-            return False
-
-        return False
-
-    # -----------------------------
     # PHP SOURCES detection
     # -----------------------------
     def _is_php_source_text(self, text: str) -> bool:
@@ -365,9 +353,6 @@ class CodeParser:
             class_stack = self._get_enclosing_classes(def_node, content)
             uid = self._def_uid(module_id, name, class_stack)
 
-            # WEB entry: only annotations/decorators on definition (where applicable)
-            is_entry = self._is_web_entry_by_definition_annotation(def_node, content)
-
             # SOURCES: PHP only
             is_source = False
             if self.lang == "php":
@@ -380,83 +365,114 @@ class CodeParser:
             nodes.append(Node(
                 uid=uid, name=name, file=str(path),
                 line=start_line, end_line=end_line,
-                is_entry=is_entry, is_source=is_source
+                is_source=is_source
             ))
 
         return nodes
 
-    def _is_web_entry_by_definition_annotation(self, def_node, content: bytes) -> bool:
-        txt = safe_text(content, def_node)
-        low = txt.lower()
+    # -----------------------------
+    # Route handler extraction (for graph building, not entry marking)
+    # -----------------------------
+    def _extract_route_handlers(self, tree, path: Path, content: bytes, module_id: str) -> List[Node]:
+        """Extract anonymous functions from route registrations for graph building."""
+        nodes: List[Node] = []
+        
+        if self.lang in {"javascript", "typescript", "tsx"}:
+            nodes.extend(self._extract_js_route_handlers(tree, path, content, module_id))
+        elif self.lang == "php":
+            nodes.extend(self._extract_php_route_handlers(tree, path, content, module_id))
+        
+        return nodes
 
-        if self.lang == "python":
-            if "@" in txt:
-                keys = [
-                    ".route", " route",
-                    ".get", ".post", ".put", ".delete", ".patch", ".options", ".head",
-                    "websocket"
-                ]
-                if any(k in low for k in keys):
-                    return True
-            if "path(" in low or "re_path(" in low:
-                return True
-            return False
+    def _extract_js_route_handlers(self, tree, path: Path, content: bytes, module_id: str) -> List[Node]:
+        """Extract anonymous functions from JS/TS route registrations."""
+        nodes: List[Node] = []
+        route_methods = {"get", "post", "put", "delete", "patch", "options", "head", "all", "use"}
 
-        if self.lang in ("javascript", "typescript", "javascriptreact", "typescriptreact", "tsx"):
-            call_patterns = [
-                "app.get(", "app.post(", "app.put(", "app.delete(", "app.patch(",
-                "router.get(", "router.post(", "router.put(", "router.delete(", "router.patch(",
-                "route("
-            ]
-            if any(p in low for p in call_patterns):
-                return True
+        def mk_anon_uid(line0: int) -> str:
+            return f"{module_id}.<anon@{line0+1}>"
 
-            if "@" in txt:
-                nest_keys = ["@get", "@post", "@put", "@delete", "@patch", "@options", "@head", "@requestmapping"]
-                if any(k in low for k in nest_keys):
-                    return True
-            return False
+        for n in walk(tree.root_node):
+            if n.type != "call_expression":
+                continue
+            fn = n.child_by_field_name("function")
+            args = n.child_by_field_name("arguments")
+            if not fn or not args:
+                continue
 
-        if self.lang == "java":
-            spring_annotations = [
-                "@requestmapping", "@getmapping", "@postmapping",
-                "@putmapping", "@deletemapping", "@patchmapping"
-            ]
-            return any(a in low for a in spring_annotations)
+            callee = normalize_callee(safe_text(content, fn))
+            last = callee.split(".")[-1] if callee else ""
+            if last not in route_methods:
+                continue
 
-        if self.lang == "c_sharp":
-            attributes = [
-                "[httpget", "[httppost", "[httpput", "[httpdelete", "[httppatch",
-                "[route", "[acceptverbs"
-            ]
-            if any(a in low for a in attributes):
-                return True
+            arg_children = [c for c in args.children if getattr(c, "is_named", False)]
+            if not arg_children:
+                continue
+            handler = arg_children[-1]
 
-            map_patterns = [".mapget", ".mappost", ".mapput", ".mapdelete", ".mappatch", ".mapgroup"]
-            if any(m in low for m in map_patterns):
-                return True
+            if handler.type in {"arrow_function", "function_expression"}:
+                uid = mk_anon_uid(handler.start_point[0])
+                nodes.append(Node(
+                    uid=uid,
+                    name=f"<anon@{handler.start_point[0]+1}>",
+                    file=str(path),
+                    line=handler.start_point[0] + 1,
+                    end_line=handler.end_point[0] + 1
+                ))
 
-            return False
+        return nodes
 
-        if self.lang == "php":
-            return ("#[route" in low) or ("@route" in low) or ("Route" in low)
+    def _extract_php_route_handlers(self, tree, path: Path, content: bytes, module_id: str) -> List[Node]:
+        """Extract anonymous functions from PHP route registrations."""
+        nodes: List[Node] = []
+        route_methods = {
+            "get", "post", "put", "delete", "patch", "options",
+            "any", "match", "resource", "apiresource", "group"
+        }
 
-        if self.lang == "go":
-            go_patterns = [".get(", ".post(", ".put(", ".delete(", ".patch(", ".group(", ".handlefunc("]
-            return any(p in low for p in go_patterns)
+        def add_anon(line0: int, closure_text: str) -> str:
+            uid = f"{module_id}.<anon@{line0+1}>"
+            is_source = self._is_php_source_text(closure_text)
+            nodes.append(Node(
+                uid=uid,
+                name=f"<anon@{line0+1}>",
+                file=str(path),
+                line=line0 + 1,
+                end_line=line0 + max(0, closure_text.count("\n")) + 1,
+                is_source=is_source
+            ))
+            return uid
 
-        if self.lang == "ruby":
-            ruby_patterns = [
-                "get '", 'get "',
-                "post '", 'post "',
-                "put '", 'put "',
-                "delete '", 'delete "',
-                "patch '", 'patch "',
-                "resources :"
-            ]
-            return any(p in low for p in ruby_patterns)
+        for n in walk(tree.root_node):
+            if n.type not in {"function_call_expression", "scoped_call_expression", "member_call_expression"}:
+                continue
 
-        return False
+            call_txt = normalize_callee(safe_text(content, n))
+            m = re.search(r"\bRoute\.(\w+)\s*\(", call_txt)
+            if not m:
+                continue
+            method = m.group(1).lower()
+            if method not in route_methods:
+                continue
+
+            args = None
+            for ch in getattr(n, "children", []):
+                if ch.type in {"arguments", "argument_list"}:
+                    args = ch
+                    break
+            if not args:
+                continue
+
+            named_args = [c for c in args.children if getattr(c, "is_named", False)]
+            if len(named_args) < 2:
+                continue
+            handler = named_args[1]
+            htxt = safe_text(content, handler).strip()
+
+            if "function" in htxt or "fn(" in htxt:
+                add_anon(handler.start_point[0], htxt)
+
+        return nodes
 
     # -----------------------------
     # Call extraction (graph edges)
@@ -563,188 +579,170 @@ class CodeParser:
         return out
 
     # -----------------------------
-    # WEB entrypoint extraction from route registrations
+    # String concatenation extraction (sinks)
     # -----------------------------
-    def _extract_web_entrypoints(self, tree, path: Path, content: bytes, module_id: str, nodes: List[Node]) -> Set[str]:
-        by_name_local: Dict[str, List[str]] = defaultdict(list)
-        for n in nodes:
-            by_name_local[n.name].append(n.uid)
+    def _extract_string_concats(self, tree, path: Path, content: bytes, module_id: str) -> Tuple[List[Node], List[Edge]]:
+        """Extract string concatenation operations as sinks."""
+        nodes: List[Node] = []
+        edges: List[Edge] = []
+        
+        queries = self.spec.get("string_concat_queries", [])
+        if not queries:
+            return nodes, edges
+        
+        caps = self._run_queries(queries, tree.root_node)
+        
+        scope_types = self.spec.get("scope_node_types", set())
+        
+        def get_def_name(scope_node) -> Optional[str]:
+            name_node = scope_node.child_by_field_name("name")
+            if name_node:
+                return safe_text(content, name_node)
+            for child in getattr(scope_node, "children", []):
+                if child.type in {"identifier", "property_identifier", "name", "field_identifier"}:
+                    return safe_text(content, child)
+            return None
 
-        entry_uids: Set[str] = set()
-
-        if self.lang == "python":
-            entry_uids |= self._web_entries_python(tree, content, module_id, by_name_local)
-
-        elif self.lang in {"javascript", "typescript", "tsx"}:
-            entry_uids |= self._web_entries_js(tree, path, content, module_id, by_name_local, nodes)
-
-        elif self.lang == "php":
-            entry_uids |= self._web_entries_php(tree, path, content, module_id, by_name_local, nodes)
-
-        elif self.lang == "go":
-            entry_uids |= self._web_entries_go(tree, content, module_id, by_name_local)
-
-        return entry_uids
-
-    def _web_entries_python(self, tree, content: bytes, module_id: str,
-                           by_name_local: Dict[str, List[str]]) -> Set[str]:
-        out: Set[str] = set()
-        for n in walk(tree.root_node):
-            if n.type != "call":
+        def find_scope_uid(node) -> str:
+            curr = node
+            while curr:
+                if curr.type in scope_types or curr.type.endswith("definition") or curr.type.endswith("declaration"):
+                    nm = get_def_name(curr)
+                    if nm:
+                        class_stack = self._get_enclosing_classes(curr, content)
+                        return self._def_uid(module_id, nm, class_stack)
+                curr = curr.parent
+            return f"{module_id}.<global>"
+        
+        def is_string_node(node) -> bool:
+            """Check if node represents a string literal."""
+            node_type = node.type
+            if node_type == "string":
+                return True
+            # Check for string-like types in different languages
+            if node_type in {"string_literal", "string_fragment", "template_string"}:
+                return True
+            # Check if it's a string by looking at children or text
+            text = safe_text(content, node).strip()
+            if text.startswith(('"', "'", 'f"', "f'", 'r"', "r'", 'b"', "b'")):
+                return True
+            return False
+        
+        def has_string_operand(node) -> bool:
+            """Check if binary operator has at least one string operand."""
+            if node.type not in {"binary_operator", "binary_expression"}:
+                return False
+            left = node.child_by_field_name("left")
+            right = node.child_by_field_name("right")
+            if left and is_string_node(left):
+                return True
+            if right and is_string_node(right):
+                return True
+            # Also check recursively for nested expressions
+            if left:
+                left_text = safe_text(content, left).strip()
+                if left_text.startswith(('"', "'", 'f"', "f'", '`')):
+                    return True
+            if right:
+                right_text = safe_text(content, right).strip()
+                if right_text.startswith(('"', "'", 'f"', "f'", '`')):
+                    return True
+            return False
+        
+        processed_nodes = set()  # Avoid duplicates
+        
+        for node, tag in caps:
+            # Skip if already processed
+            node_id = (node.start_byte, node.end_byte)
+            if node_id in processed_nodes:
                 continue
-            fn = n.child_by_field_name("function")
-            args = n.child_by_field_name("arguments")
-            if not fn or not args:
-                continue
-
-            callee = normalize_callee(safe_text(content, fn))
-            if not callee:
-                continue
-
-            if callee.endswith("add_url_rule"):
-                for arg in walk(args):
-                    if arg.type == "identifier":
-                        name = safe_text(content, arg)
-                        for uid in by_name_local.get(name, []):
-                            out.add(uid)
-        return out
-
-    def _web_entries_js(self, tree, path: Path, content: bytes, module_id: str,
-                       by_name_local: Dict[str, List[str]], nodes: List[Node]) -> Set[str]:
-        out: Set[str] = set()
-        route_methods = {"get", "post", "put", "delete", "patch", "options", "head", "all", "use"}
-
-        def mk_anon_uid(line0: int) -> str:
-            return f"{module_id}.<anon@{line0+1}>"
-
-        for n in walk(tree.root_node):
-            if n.type != "call_expression":
-                continue
-            fn = n.child_by_field_name("function")
-            args = n.child_by_field_name("arguments")
-            if not fn or not args:
-                continue
-
-            callee = normalize_callee(safe_text(content, fn))
-            last = callee.split(".")[-1] if callee else ""
-            if last not in route_methods:
-                continue
-
-            arg_children = [c for c in args.children if getattr(c, "is_named", False)]
-            if not arg_children:
-                continue
-            handler = arg_children[-1]
-
-            if handler.type == "identifier":
-                name = safe_text(content, handler)
-                for uid in by_name_local.get(name, []):
-                    out.add(uid)
-            elif handler.type in {"arrow_function", "function_expression"}:
-                uid = mk_anon_uid(handler.start_point[0])
-                nodes.append(Node(
-                    uid=uid,
-                    name=f"<anon@{handler.start_point[0]+1}>",
-                    file=str(path),
-                    line=handler.start_point[0] + 1,
-                    end_line=handler.end_point[0] + 1,
-                    is_entry=True
-                ))
-                out.add(uid)
-
-        return out
-
-    def _web_entries_php(self, tree, path: Path, content: bytes, module_id: str,
-                         by_name_local: Dict[str, List[str]], nodes: List[Node]) -> Set[str]:
-        out: Set[str] = set()
-        route_methods = {
-            "get", "post", "put", "delete", "patch", "options",
-            "any", "match", "resource", "apiresource", "group"
-        }
-
-        def add_anon(line0: int, closure_text: str) -> str:
-            uid = f"{module_id}.<anon@{line0+1}>"
-            is_source = self._is_php_source_text(closure_text)
-            nodes.append(Node(
-                uid=uid,
-                name=f"<anon@{line0+1}>",
-                file=str(path),
-                line=line0 + 1,
-                end_line=line0 + max(0, closure_text.count("\n")) + 1,
-                is_entry=True,
-                is_source=is_source
-            ))
-            return uid
-
-        for n in walk(tree.root_node):
-            if n.type not in {"function_call_expression", "scoped_call_expression", "member_call_expression"}:
-                continue
-
-            call_txt = normalize_callee(safe_text(content, n))
-            m = re.search(r"\bRoute\.(\w+)\s*\(", call_txt)
-            if not m:
-                continue
-            method = m.group(1).lower()
-            if method not in route_methods:
-                continue
-
-            args = None
-            for ch in getattr(n, "children", []):
-                if ch.type in {"arguments", "argument_list"}:
-                    args = ch
+            processed_nodes.add(node_id)
+            
+            # Language-specific filtering
+            if self.lang == "python":
+                if tag == "fstring":
+                    # Check if it's actually an f-string
+                    text = safe_text(content, node).strip()
+                    if not (text.startswith('f"') or text.startswith("f'")):
+                        continue
+                elif tag == "concat":
+                    # Only process if it's string concatenation
+                    if not has_string_operand(node):
+                        continue
+                elif tag == "modulo":
+                    # % formatting is always string-related
+                    pass
+            elif self.lang in {"javascript", "typescript", "tsx"}:
+                if tag == "template":
+                    # Template literals are always string sinks
+                    pass
+                elif tag == "concat":
+                    # Only process if it's string concatenation
+                    if not has_string_operand(node):
+                        continue
+            elif self.lang == "go":
+                if tag == "concat":
+                    # Only process if it's string concatenation
+                    if not has_string_operand(node):
+                        continue
+            elif self.lang == "php":
+                if tag == "concat":
+                    # In PHP, . is string concatenation, + might be numeric
+                    # But we'll process both as they can be used for strings
+                    pass
+            elif self.lang == "ruby":
+                if tag == "string_interp":
+                    # String interpolation is always a sink
+                    pass
+                elif tag == "concat":
+                    # Only process if it's string concatenation
+                    if not has_string_operand(node):
+                        continue
+            elif self.lang == "c_sharp":
+                if tag == "interpolated":
+                    # Interpolated strings are always sinks
+                    pass
+                elif tag == "concat":
+                    # Only process if it's string concatenation
+                    if not has_string_operand(node):
+                        continue
+            elif self.lang == "java":
+                if tag == "concat":
+                    # Only process if it's string concatenation
+                    if not has_string_operand(node):
+                        continue
+            
+            # Create sink node
+            line = node.start_point[0] + 1
+            sink_uid = f"builtin.{self.lang}.<string_concat@{line}>"
+            sink_name = f"<string_concat@{line}>"
+            
+            # Check if sink node already exists
+            sink_node = None
+            for n in nodes:
+                if n.uid == sink_uid:
+                    sink_node = n
                     break
-            if not args:
-                continue
-
-            named_args = [c for c in args.children if getattr(c, "is_named", False)]
-            if len(named_args) < 2:
-                continue
-            handler = named_args[1]
-            htxt = safe_text(content, handler).strip()
-
-            if "function" in htxt or "fn(" in htxt:
-                out.add(add_anon(handler.start_point[0], htxt))
-                continue
-
-            # ["Controller", "method"]
-            if htxt.startswith("[") and htxt.endswith("]"):
-                m2 = re.findall(r"['\"]([A-Za-z0-9_]+)['\"]", htxt)
-                if m2:
-                    meth = m2[-1]
-                    for uid in by_name_local.get(meth, []):
-                        out.add(uid)
-                continue
-
-            # 'Controller@method'
-            if ("@" in htxt) and (htxt.startswith(("'", '"'))):
-                s = htxt.strip("'\"")
-                parts = s.split("@", 1)
-                if len(parts) == 2:
-                    meth = parts[1]
-                    for uid in by_name_local.get(meth, []):
-                        out.add(uid)
-                continue
-
-        return out
-
-    def _web_entries_go(self, tree, content: bytes, module_id: str,
-                        by_name_local: Dict[str, List[str]]) -> Set[str]:
-        out: Set[str] = set()
-        for n in walk(tree.root_node):
-            if n.type != "call_expression":
-                continue
-            fn = n.child_by_field_name("function")
-            args = n.child_by_field_name("arguments")
-            if not fn or not args:
-                continue
-            callee = normalize_callee(safe_text(content, fn))
-            if not (callee.endswith("HandleFunc") or callee.endswith(".HandleFunc") or callee.endswith("Handle")):
-                continue
-            arg_children = [c for c in args.children if getattr(c, "is_named", False)]
-            if len(arg_children) < 2:
-                continue
-            handler = arg_children[1]
-            if handler.type == "identifier":
-                name = safe_text(content, handler)
-                for uid in by_name_local.get(name, []):
-                    out.add(uid)
-        return out
+            
+            if not sink_node:
+                sink_node = Node(
+                    uid=sink_uid,
+                    name=sink_name,
+                    file=str(path),
+                    line=line,
+                    end_line=node.end_point[0] + 1,
+                    is_sink=True,
+                    is_builtin=True
+                )
+                nodes.append(sink_node)
+            
+            # Create edge from containing scope to sink
+            caller_uid = find_scope_uid(node)
+            edges.append(Edge(
+                src=caller_uid,
+                dst=sink_uid,
+                file=str(path),
+                line=line
+            ))
+        
+        return nodes, edges

@@ -22,6 +22,8 @@ KNOWN_SINKS: Dict[str, Set[str]] = {
         "zipfile.ZipFile.extractall", "tarfile.TarFile.extractall",
         "flask.redirect", "django.shortcuts.redirect",
         "re.compile", "re.search",
+        # String formatting methods
+        "str.format", "format", "str.join", "join",
     },
     "javascript": {
         # Existing sinks
@@ -39,6 +41,8 @@ KNOWN_SINKS: Dict[str, Set[str]] = {
         "fs.writeFile", "fs.unlink", # File System
         "res.redirect", "window.location.href", # Open Redirect
         "new RegExp", "RegExp", # ReDoS
+        # String formatting methods
+        "String.prototype.concat", "Array.prototype.join",
     },
     # typescript & tsx share a lot with javascript
     "typescript": {
@@ -55,6 +59,8 @@ KNOWN_SINKS: Dict[str, Set[str]] = {
         "fs.writeFile",
         "res.redirect",
         "new RegExp",
+        # String formatting methods
+        "String.prototype.concat", "Array.prototype.join",
     },
     "tsx": {
         "eval", "Function", "setTimeout", "setInterval",
@@ -67,6 +73,8 @@ KNOWN_SINKS: Dict[str, Set[str]] = {
         "http.request", "axios.get",
         "res.redirect",
         "new RegExp",
+        # String formatting methods
+        "String.prototype.concat", "Array.prototype.join",
     },
     "java": {
         # Existing sinks
@@ -83,6 +91,8 @@ KNOWN_SINKS: Dict[str, Set[str]] = {
         "Files.write", "File.delete", # File system
         "response.sendRedirect", "new RedirectView", # Open Redirect
         "Pattern.compile", "String.matches", # ReDoS
+        # String formatting methods
+        "String.format", "StringBuilder.append", "StringBuilder.toString",
     },
     "php": {
         # Existing sinks and user requests
@@ -98,6 +108,8 @@ KNOWN_SINKS: Dict[str, Set[str]] = {
         "header", # Open Redirect
         "sleep", "usleep", # DoS
         "preg_match", # ReDoS
+        # String formatting methods
+        "sprintf", "vsprintf", "printf", "vprintf",
     },
     "go": {
         # Existing sinks
@@ -112,7 +124,8 @@ KNOWN_SINKS: Dict[str, Set[str]] = {
         "http.Get", "http.Post", "net.Dial", # SSRF
         "os.Remove", "os.WriteFile", # File System
         "http.Redirect", # Open Redirect
-        "fmt.Sprintf",
+        "fmt.Sprintf", # String formatting
+        "strings.Join", # String concatenation
         "regexp.Compile", # ReDoS
     },
     "ruby": {
@@ -129,6 +142,8 @@ KNOWN_SINKS: Dict[str, Set[str]] = {
         "redirect_to", # Open Redirect
         "Regexp.new", # ReDoS
         "sleep", # DoS
+        # String formatting methods
+        "String#%", "String#format", "Array#join",
     },
     "c_sharp": {
         # Existing sinks (c_sharp -> CSharp)
@@ -144,6 +159,8 @@ KNOWN_SINKS: Dict[str, Set[str]] = {
         "File.WriteAllText", "Directory.Delete", # File System
         "Response.Redirect", "RedirectToAction", "RedirectPermanent", # Open Redirect
         "new Regex", "Regex.Match", # ReDoS
+        # String formatting methods
+        "String.Format", "StringBuilder.Append", "StringBuilder.ToString",
     },
     # New languages from regex logs
     "clojure": {
