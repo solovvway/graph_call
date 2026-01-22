@@ -3,11 +3,11 @@
 import sys
 import hashlib
 from pathlib import Path
-from typing import Dict, List, Set, Tuple, Optional, DefaultDict
+from typing import Dict, List, Set, Tuple, Optional, DefaultDict, Any
 from collections import defaultdict
 import logging
 
-from .ast_core import Node
+from .ast_core import Node, LANG_SPECS, EXT_TO_LANG
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +30,11 @@ class TraceProcessor:
         self._collected_traces: Dict[int, Tuple[List[str], str, Dict[str, str]]] = {}
         
         self._traces_found: int = 0  # Счетчик найденных trace'ов для прогресс-бара
+        
+        # Cache for parsers and class definitions
+        self._parser_cache: Dict[str, Any] = {}  # lang -> parser
+        self._language_cache: Dict[str, Any] = {}  # lang -> language
+        self._class_def_cache: Dict[Tuple[str, str], Optional[Tuple[int, int]]] = {}  # (file, class_name) -> (start_line, end_line)
 
     def _get_file_lines(self, file_path: str) -> List[str]:
         if file_path in self._file_text_cache:
@@ -41,6 +46,136 @@ class TraceProcessor:
             lines = []
         self._file_text_cache[file_path] = lines
         return lines
+    
+    def _get_language_from_file(self, file_path: str) -> Optional[str]:
+        """Determine language from file extension."""
+        ext = Path(file_path).suffix
+        return EXT_TO_LANG.get(ext)
+    
+    def _get_parser(self, lang: str):
+        """Get or create parser for language."""
+        if lang in self._parser_cache:
+            return self._parser_cache[lang]
+        
+        try:
+            from tree_sitter_languages import get_parser, get_language
+            parser = get_parser(lang)
+            language = get_language(lang)
+            self._parser_cache[lang] = parser
+            self._language_cache[lang] = language
+            return parser
+        except Exception as e:
+            logger.debug(f"Failed to get parser for {lang}: {e}")
+            return None
+    
+    def _find_class_definition(self, file_path: str, class_name: str) -> Optional[Tuple[int, int]]:
+        """
+        Find class definition in file and return (start_line, end_line).
+        Returns None if class not found.
+        """
+        cache_key = (file_path, class_name)
+        if cache_key in self._class_def_cache:
+            return self._class_def_cache[cache_key]
+        
+        lang = self._get_language_from_file(file_path)
+        if not lang:
+            self._class_def_cache[cache_key] = None
+            return None
+        
+        parser = self._get_parser(lang)
+        if not parser:
+            self._class_def_cache[cache_key] = None
+            return None
+        
+        try:
+            content = Path(file_path).read_bytes()
+            tree = parser.parse(content)
+            
+            lang_spec = LANG_SPECS.get(lang, {})
+            class_node_types = lang_spec.get("class_node_types", set())
+            
+            if not class_node_types:
+                self._class_def_cache[cache_key] = None
+                return None
+            
+            language = self._language_cache.get(lang)
+            if not language:
+                self._class_def_cache[cache_key] = None
+                return None
+            
+            # Walk tree to find class definition
+            def walk_tree(node):
+                stack = [node]
+                while stack:
+                    n = stack.pop()
+                    if n.type in class_node_types:
+                        # Check if this is the class we're looking for
+                        name_node = n.child_by_field_name("name")
+                        if name_node:
+                            class_name_found = content[name_node.start_byte:name_node.end_byte].decode("utf-8", errors="ignore")
+                            if class_name_found == class_name:
+                                start_line = n.start_point[0] + 1
+                                end_line = n.end_point[0] + 1
+                                return (start_line, end_line)
+                    
+                    # Add children to stack
+                    for child in n.children:
+                        stack.append(child)
+                return None
+            
+            result = walk_tree(tree.root_node)
+            self._class_def_cache[cache_key] = result
+            return result
+            
+        except Exception as e:
+            logger.debug(f"Error finding class {class_name} in {file_path}: {e}")
+            self._class_def_cache[cache_key] = None
+            return None
+    
+    def _is_class_method(self, uid: str, file_path: Optional[str] = None) -> Tuple[bool, Optional[str], Optional[str]]:
+        """
+        Check if UID represents a class method.
+        Returns (is_method, class_name, method_name) or (False, None, None).
+        
+        For UID format like: module.submodule.ClassName.method
+        We try to identify if second-to-last part is a class name.
+        """
+        parts = uid.split(".")
+        if len(parts) < 3:
+            return (False, None, None)
+        
+        # Method name is always the last part
+        method_name = parts[-1]
+        
+        # Class name should be second to last
+        # UID format: module.submodule.ClassName.method
+        # We need at least: module.ClassName.method (3 parts)
+        if len(parts) >= 3:
+            class_name = parts[-2]
+            
+            # First, use heuristics to quickly identify likely class methods
+            # For Python/Java/C#: class names typically start with uppercase
+            is_likely_class = class_name and len(class_name) > 0 and class_name[0].isupper()
+            
+            # If file_path is provided and it looks like a class, verify by finding the class
+            if file_path and is_likely_class:
+                # Try to find class definition - if found, it's definitely a class method
+                class_def = self._find_class_definition(file_path, class_name)
+                if class_def:
+                    return (True, class_name, method_name)
+            
+            # If heuristic suggests it's a class, return True
+            # (even if we couldn't verify, we'll try to find the class in _node_code)
+            if is_likely_class:
+                return (True, class_name, method_name)
+            
+            # If we have 3+ parts, it might still be a class method
+            # (some languages don't follow uppercase convention)
+            # We'll try to find the class in _node_code
+            if len(parts) >= 3:
+                return (True, class_name, method_name)
+        
+        return (False, None, None)
 
     def _node_code(self, nodes: Dict[str, Node], uid: str, max_lines: int = 400) -> str:
         n = nodes[uid]
@@ -51,6 +186,27 @@ class TraceProcessor:
         if not lines:
             return ""
 
+        # Check if this is a class method - if so, extract entire class code
+        is_method, class_name, method_name = self._is_class_method(uid, n.file)
+        
+        if is_method and class_name:
+            # Try to find class definition
+            class_def = self._find_class_definition(n.file, class_name)
+            if class_def:
+                class_start, class_end = class_def
+                # Extract entire class code
+                start = max(1, class_start)
+                end = min(len(lines), class_end)
+                
+                # Keep output bounded
+                if (end - start + 1) > max_lines:
+                    end = start + max_lines - 1
+                
+                snippet = lines[start - 1:end]
+                return "\n".join(snippet)
+            # If class not found, fall through to method-only extraction
+        
+        # Default: extract method/function code only
         start = max(1, int(n.line or 1))
         end = int(n.end_line or n.line or start)
         end = max(start, end)
