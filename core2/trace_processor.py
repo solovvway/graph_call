@@ -12,9 +12,8 @@ from .ast_core import Node
 logger = logging.getLogger(__name__)
 
 class TraceProcessor:
-    def __init__(self, show_code: bool = False, out_dir: Optional[Path] = None):
+    def __init__(self, show_code: bool = False):
         self.show_code = show_code
-        self.out_dir = out_dir
         self._trace_counter: int = 0
         self._file_text_cache: Dict[str, List[str]] = {}
         
@@ -26,6 +25,9 @@ class TraceProcessor:
         # Store function code separately to avoid duplication
         # Maps: trace_id -> {uid: code}
         self._trace_code_cache: Dict[int, Dict[str, str]] = {}
+        
+        # Store collected traces: trace_id -> (path, code_hash, code_cache)
+        self._collected_traces: Dict[int, Tuple[List[str], str, Dict[str, str]]] = {}
         
         self._traces_found: int = 0  # Счетчик найденных trace'ов для прогресс-бара
 
@@ -252,114 +254,95 @@ class TraceProcessor:
         sys.stdout.flush()
 
     def emit_trace(self, path: List[str], nodes: Dict[str, Node], edge_sites: DefaultDict[Tuple[str, str], List[Tuple[str, int]]]):
+        """Collect trace without saving. Returns trace_id for later retrieval."""
         self._traces_found += 1
-
-        # File output with deduplication
-        if self.out_dir:
-            self.out_dir.mkdir(parents=True, exist_ok=True)
+        
+        code_hash = self._get_path_code_hash(path, nodes)
+        
+        # Build code cache for this path (only for functions, not sinks)
+        code_cache: Dict[str, str] = {}
+        if self.show_code:
+            for uid in path:
+                if uid not in code_cache:
+                    code = self._node_code(nodes, uid)
+                    if code:
+                        code_cache[uid] = code
+        
+        # Проверяем, есть ли уже трейс с таким же кодом функций
+        existing = self._find_existing_file_for_path(path, nodes)
+        
+        if existing:
+            # Найден существующий трейс - добавляем новый путь в него
+            existing_trace_id, existing_path = existing
+            path_tuple = tuple(path)
             
-            code_hash = self._get_path_code_hash(path, nodes)
+            # Обновляем множество путей для этого хеша
+            if code_hash in self._code_hash_to_file:
+                trace_id, existing_paths = self._code_hash_to_file[code_hash]
+                existing_paths.add(path_tuple)
+                
+                # Обновляем кэш кода - добавляем только новые функции
+                if existing_trace_id in self._trace_code_cache:
+                    existing_code_cache = self._trace_code_cache[existing_trace_id]
+                    # Добавляем только код функций, которых еще нет
+                    for uid, code in code_cache.items():
+                        if uid not in existing_code_cache:
+                            existing_code_cache[uid] = code
+                else:
+                    self._trace_code_cache[existing_trace_id] = code_cache.copy()
+                
+                # Обновляем сохраненный трейс - добавляем новый путь
+                if existing_trace_id in self._collected_traces:
+                    old_path, old_hash, old_cache = self._collected_traces[existing_trace_id]
+                    # Объединяем кэши кода
+                    merged_cache = {**old_cache, **code_cache}
+                    # Сохраняем первый путь как основной
+                    self._collected_traces[existing_trace_id] = (old_path, old_hash, merged_cache)
+                
+                logger.debug(f"Added path to existing trace {existing_trace_id} (code_hash: {code_hash[:8]}...)")
+        else:
+            # Новый уникальный код - создаем новый трейс
+            self._trace_counter += 1
+            trace_id = self._trace_counter
             
-            # Build code cache for this path (only for functions, not sinks)
-            code_cache: Dict[str, str] = {}
-            if self.show_code:
-                for uid in path:
-                    if uid not in code_cache:
-                        code = self._node_code(nodes, uid)
-                        if code:
-                            code_cache[uid] = code
-            
-            # Проверяем, есть ли уже файл с таким же кодом функций
-            existing = self._find_existing_file_for_path(path, nodes)
-            
-            if existing:
-                # Найден существующий файл - добавляем новый путь в него
-                existing_trace_id, existing_path = existing
+            # Сохраняем хеш для будущих проверок
+            if code_hash:
                 path_tuple = tuple(path)
-                
-                # Обновляем множество путей для этого хеша
-                if code_hash in self._code_hash_to_file:
-                    trace_id, existing_paths = self._code_hash_to_file[code_hash]
-                    existing_paths.add(path_tuple)
-                    
-                    # Обновляем кэш кода - добавляем только новые функции
-                    if existing_trace_id in self._trace_code_cache:
-                        existing_code_cache = self._trace_code_cache[existing_trace_id]
-                        # Добавляем только код функций, которых еще нет
-                        for uid, code in code_cache.items():
-                            if uid not in existing_code_cache:
-                                existing_code_cache[uid] = code
-                    else:
-                        self._trace_code_cache[existing_trace_id] = code_cache.copy()
-                    
-                    # Читаем существующий файл и добавляем новый путь
-                    txt_file = self.out_dir / f"{existing_trace_id}.txt"
-                    code_file = self.out_dir / f"{existing_trace_id}_code.txt"
-                    
-                    # Получаем полный кэш кода для этого trace
-                    full_code_cache = self._trace_code_cache.get(existing_trace_id, {})
-                    
-                    # Добавляем новый путь в текстовый файл (без кода)
-                    if txt_file.exists():
-                        existing_content = txt_file.read_text(encoding="utf-8", errors="ignore")
-                        new_path_text = self._path_to_text(path, nodes, edge_sites, code_cache=None, show_code=False)
-                        # Добавляем разделитель и новый путь
-                        updated_content = existing_content + "\n\n---\n\n" + new_path_text
-                        txt_file.write_text(updated_content, encoding="utf-8", errors="ignore")
-                    else:
-                        # Если файл почему-то не существует, создаем заново
-                        txt_file.write_text(
-                            self._path_to_text(path, nodes, edge_sites, code_cache=None, show_code=False),
-                            encoding="utf-8", errors="ignore"
-                        )
-                    
-                    # Обновляем файл с кодом (только если show_code=True)
-                    # Для первого пути показываем код, для остальных - только структуру
-                    if self.show_code:
-                        all_paths = list(existing_paths)
-                        all_paths_text = []
-                        for idx, p in enumerate(all_paths):
-                            # Первый путь - с кодом, остальные - без кода
-                            show_code_for_path = (idx == 0)
-                            all_paths_text.append(
-                                self._path_to_text(list(p), nodes, edge_sites, code_cache=full_code_cache, show_code=show_code_for_path)
-                            )
-                        
-                        code_file.write_text(
-                            "\n\n---\n\n".join(all_paths_text),
-                            encoding="utf-8", errors="ignore"
-                        )
-                    
-                    logger.debug(f"Added path to existing trace file {existing_trace_id} (code_hash: {code_hash[:8]}...)")
-            else:
-                # Новый уникальный код - создаем новый файл
-                self._trace_counter += 1
-                trace_id = self._trace_counter
-                
-                # Сохраняем хеш для будущих проверок
-                if code_hash:
-                    path_tuple = tuple(path)
-                    self._code_hash_to_file[code_hash] = (trace_id, {path_tuple})
-                
-                # Сохраняем кэш кода
-                if self.show_code:
-                    self._trace_code_cache[trace_id] = code_cache.copy()
-                
-                # Создаем файл без кода
-                (self.out_dir / f"{trace_id}.txt").write_text(
-                    self._path_to_text(path, nodes, edge_sites, code_cache=None),
-                    encoding="utf-8", errors="ignore"
-                )
-                
-                # Создаем файл с кодом только если show_code=True
-                if self.show_code:
-                    (self.out_dir / f"{trace_id}_code.txt").write_text(
-                        self._path_to_text(path, nodes, edge_sites, code_cache=code_cache),
-                        encoding="utf-8", errors="ignore"
-                    )
+                self._code_hash_to_file[code_hash] = (trace_id, {path_tuple})
+            
+            # Сохраняем кэш кода
+            if self.show_code:
+                self._trace_code_cache[trace_id] = code_cache.copy()
+            
+            # Сохраняем трейс для последующего извлечения
+            self._collected_traces[trace_id] = (path, code_hash, code_cache)
         
         # Обновляем прогресс-бар (перезаписываем строку на месте)
         self._update_progress()
+    
+    def get_trace_text(self, trace_id: int, nodes: Dict[str, Node], edge_sites: DefaultDict[Tuple[str, str], List[Tuple[str, int]]], show_code: bool = True) -> str:
+        """Get trace text for a given trace_id."""
+        if trace_id not in self._collected_traces:
+            return ""
+        
+        path, code_hash, code_cache = self._collected_traces[trace_id]
+        
+        # Если нужно показать код, используем кэш
+        if show_code and code_cache:
+            return self._path_to_text(path, nodes, edge_sites, code_cache=code_cache, show_code=True)
+        else:
+            return self._path_to_text(path, nodes, edge_sites, code_cache=None, show_code=False)
+    
+    def get_all_trace_ids(self) -> List[int]:
+        """Get all collected trace IDs."""
+        return sorted(self._collected_traces.keys())
+    
+    def get_trace_path(self, trace_id: int) -> Optional[List[str]]:
+        """Get trace path for a given trace_id."""
+        if trace_id not in self._collected_traces:
+            return None
+        path, _, _ = self._collected_traces[trace_id]
+        return path
 
     def reset_counter(self):
         """Сбрасывает счетчик найденных trace'ов"""

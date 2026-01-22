@@ -108,7 +108,7 @@ class SecurityGraph:
 
     def trace_all(self, show_code: bool = False, out_dir: Optional[Path] = None):
         # Initialize trace processor
-        self.trace_processor = TraceProcessor(show_code=show_code, out_dir=out_dir)
+        self.trace_processor = TraceProcessor(show_code=show_code)
         self.trace_processor.reset_counter()
 
         print(f"\n{'='*30} VULNERABILITY REPORT {'='*30}")
