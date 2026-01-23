@@ -22,6 +22,10 @@ class TraceProcessor:
         # path_set contains all paths that share the same function code
         self._code_hash_to_file: Dict[str, Tuple[int, Set[Tuple[str, ...]]]] = {}
         
+        # Index for fast lookup: trace_id -> set of code_hashes
+        # This allows O(1) lookup instead of O(n) scan
+        self._trace_id_to_hashes: Dict[int, Set[str]] = defaultdict(set)
+        
         # Store function code separately to avoid duplication
         # Maps: trace_id -> {uid: code}
         self._trace_code_cache: Dict[int, Dict[str, str]] = {}
@@ -35,6 +39,10 @@ class TraceProcessor:
         self._parser_cache: Dict[str, Any] = {}  # lang -> parser
         self._language_cache: Dict[str, Any] = {}  # lang -> language
         self._class_def_cache: Dict[Tuple[str, str], Optional[Tuple[int, int]]] = {}  # (file, class_name) -> (start_line, end_line)
+        
+        # Cache for function code sets to avoid recomputation
+        # Maps: path_tuple -> function_code_set
+        self._path_function_set_cache: Dict[Tuple[str, ...], Set[str]] = {}
 
     def _get_file_lines(self, file_path: str) -> List[str]:
         if file_path in self._file_text_cache:
@@ -249,9 +257,15 @@ class TraceProcessor:
         """
         Возвращает множество хешей кода функций в пути (исключая sink).
         Используется для проверки, является ли путь расширением существующего.
+        Использует кэш для ускорения.
         """
         if not path or len(path) <= 1:
             return set()
+        
+        # Проверяем кэш
+        path_tuple = tuple(path)
+        if path_tuple in self._path_function_set_cache:
+            return self._path_function_set_cache[path_tuple]
         
         # Исключаем sink
         function_uids = path[:-1]
@@ -264,6 +278,8 @@ class TraceProcessor:
                 code_hash = hashlib.md5(f"{uid}:{code}".encode('utf-8')).hexdigest()
                 code_hashes.add(code_hash)
         
+        # Сохраняем в кэш
+        self._path_function_set_cache[path_tuple] = code_hashes
         return code_hashes
 
     def _find_existing_file_for_path(self, path: List[str], nodes: Dict[str, Node]) -> Optional[Tuple[int, List[str]]]:
@@ -273,13 +289,14 @@ class TraceProcessor:
         1. Найден файл с точно таким же кодом функций (хеш совпадает), или
         2. Новый путь содержит все функции из существующего пути (является расширением).
         Sink может быть разным - это нормально.
+        Оптимизировано с использованием индексов и кэша.
         """
         code_hash = self._get_path_code_hash(path, nodes)
         if not code_hash:
             # Если нет кода функций (только sink), создаем отдельный файл
             return None
         
-        # Сначала проверяем точное совпадение хеша
+        # Сначала проверяем точное совпадение хеша (O(1))
         if code_hash in self._code_hash_to_file:
             trace_id, existing_paths = self._code_hash_to_file[code_hash]
             if existing_paths:
@@ -292,15 +309,32 @@ class TraceProcessor:
         if not new_functions_set:
             return None
         
-        # Проверяем все существующие файлы
-        for existing_hash, (trace_id, existing_paths) in self._code_hash_to_file.items():
-            # Берем первый путь из существующих для проверки
-            if existing_paths:
-                existing_path = list(next(iter(existing_paths)))
+        new_path_len = len(path)
+        
+        # Оптимизация: используем индекс trace_id для более эффективного поиска
+        # Вместо прохода по всем хешам, проходим по trace_id и проверяем их пути
+        # Это быстрее, так как у нас обычно меньше trace_id, чем хешей
+        checked_trace_ids = set()
+        
+        # Проходим по всем trace_id через индекс
+        for trace_id in self._trace_id_to_hashes.keys():
+            if trace_id in checked_trace_ids:
+                continue
+            
+            # Получаем все пути для этого trace_id из всех его хешей
+            # Проверяем только пути из collected_traces, которые короче нового
+            if trace_id in self._collected_traces:
+                existing_path, _, _ = self._collected_traces[trace_id]
+                
+                # Быстрая проверка: пропускаем пути, которые не короче нового
+                if len(existing_path) >= new_path_len:
+                    continue
+                
                 existing_functions_set = self._get_functions_code_set(existing_path, nodes)
                 
                 # Если новый путь содержит все функции из существующего (является расширением)
                 if existing_functions_set and existing_functions_set.issubset(new_functions_set):
+                    checked_trace_ids.add(trace_id)
                     return (trace_id, existing_path)
         
         return None
@@ -432,30 +466,57 @@ class TraceProcessor:
             existing_trace_id, existing_path = existing
             path_tuple = tuple(path)
             
-            # Обновляем множество путей для этого хеша
-            if code_hash in self._code_hash_to_file:
-                trace_id, existing_paths = self._code_hash_to_file[code_hash]
-                existing_paths.add(path_tuple)
+            # Определяем, какой путь длиннее - используем более длинный как основной
+            use_new_path = len(path) > len(existing_path)
+            main_path = path if use_new_path else existing_path
+            
+            # Оптимизация: используем индекс для быстрого доступа к хешам этого trace_id
+            # Вместо O(n) поиска по всем хешам, используем O(1) доступ через индекс
+            if code_hash:
+                # Добавляем новый хеш в индекс
+                self._trace_id_to_hashes[existing_trace_id].add(code_hash)
                 
-                # Обновляем кэш кода - добавляем только новые функции
-                if existing_trace_id in self._trace_code_cache:
-                    existing_code_cache = self._trace_code_cache[existing_trace_id]
-                    # Добавляем только код функций, которых еще нет
-                    for uid, code in code_cache.items():
-                        if uid not in existing_code_cache:
-                            existing_code_cache[uid] = code
+                # Обновляем или создаем запись для этого хеша
+                if code_hash in self._code_hash_to_file:
+                    # Хеш уже существует - добавляем путь
+                    _, paths_set = self._code_hash_to_file[code_hash]
+                    paths_set.add(path_tuple)
                 else:
-                    self._trace_code_cache[existing_trace_id] = code_cache.copy()
-                
-                # Обновляем сохраненный трейс - добавляем новый путь
-                if existing_trace_id in self._collected_traces:
-                    old_path, old_hash, old_cache = self._collected_traces[existing_trace_id]
-                    # Объединяем кэши кода
-                    merged_cache = {**old_cache, **code_cache}
-                    # Сохраняем первый путь как основной
-                    self._collected_traces[existing_trace_id] = (old_path, old_hash, merged_cache)
-                
-                logger.debug(f"Added path to existing trace {existing_trace_id} (code_hash: {code_hash[:8]}...)")
+                    # Новый хеш для существующего trace_id
+                    # Находим существующий paths_set из любого хеша этого trace_id
+                    existing_hashes = self._trace_id_to_hashes[existing_trace_id]
+                    paths_set = None
+                    for hash_key in existing_hashes:
+                        if hash_key in self._code_hash_to_file:
+                            _, paths_set = self._code_hash_to_file[hash_key]
+                            break
+                    
+                    if paths_set is None:
+                        paths_set = set()
+                    
+                    paths_set.add(path_tuple)
+                    self._code_hash_to_file[code_hash] = (existing_trace_id, paths_set)
+            
+            # Обновляем кэш кода - добавляем только новые функции
+            if existing_trace_id in self._trace_code_cache:
+                existing_code_cache = self._trace_code_cache[existing_trace_id]
+                # Добавляем только код функций, которых еще нет
+                for uid, code in code_cache.items():
+                    if uid not in existing_code_cache:
+                        existing_code_cache[uid] = code
+            else:
+                self._trace_code_cache[existing_trace_id] = code_cache.copy()
+            
+            # Обновляем сохраненный трейс - используем более длинный путь
+            if existing_trace_id in self._collected_traces:
+                old_path, old_hash, old_cache = self._collected_traces[existing_trace_id]
+                # Объединяем кэши кода
+                merged_cache = {**old_cache, **code_cache}
+                # Используем более длинный путь как основной
+                final_hash = code_hash if code_hash else old_hash
+                self._collected_traces[existing_trace_id] = (main_path, final_hash, merged_cache)
+            
+            logger.debug(f"Added path to existing trace {existing_trace_id} (code_hash: {code_hash[:8] if code_hash else 'none'}...), using path length: {len(main_path)} (was {len(existing_path)})")
         else:
             # Новый уникальный код - создаем новый трейс
             self._trace_counter += 1
@@ -465,6 +526,8 @@ class TraceProcessor:
             if code_hash:
                 path_tuple = tuple(path)
                 self._code_hash_to_file[code_hash] = (trace_id, {path_tuple})
+                # Обновляем индекс для быстрого поиска
+                self._trace_id_to_hashes[trace_id].add(code_hash)
             
             # Сохраняем кэш кода
             if self.show_code:
