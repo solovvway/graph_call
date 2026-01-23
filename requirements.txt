@@ -3,3 +3,5 @@ tree-sitter-languages==1.10.2
 # tree-sitter
 # tree-sitter-languages
 graphviz
+pyyaml
+openai

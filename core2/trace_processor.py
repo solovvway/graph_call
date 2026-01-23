@@ -33,6 +33,10 @@ class TraceProcessor:
         # Store collected traces: trace_id -> (path, code_hash, code_cache)
         self._collected_traces: Dict[int, Tuple[List[str], str, Dict[str, str]]] = {}
         
+        # Store all sinks for each trace (for merging traces with same code but different sinks)
+        # Maps: trace_id -> set of sink UIDs
+        self._trace_sinks: Dict[int, Set[str]] = defaultdict(set)
+        
         self._traces_found: int = 0  # Счетчик найденных trace'ов для прогресс-бара
         
         # Cache for parsers and class definitions
@@ -427,7 +431,7 @@ class TraceProcessor:
             loc = f"{n.file}:{n.line}-{n.end_line}"
         return loc
 
-    def _path_to_yaml(self, path: List[str], nodes: Dict[str, Node], edge_sites: DefaultDict[Tuple[str, str], List[Tuple[str, int]]], code_cache: Optional[Dict[str, str]] = None, indent: int = 0, show_code: bool = True, shown_lines: Optional[Set[Tuple[str, int]]] = None) -> Tuple[str, Set[Tuple[str, int]]]:
+    def _path_to_yaml(self, path: List[str], nodes: Dict[str, Node], edge_sites: DefaultDict[Tuple[str, str], List[Tuple[str, int]]], code_cache: Optional[Dict[str, str]] = None, indent: int = 0, show_code: bool = True, shown_lines: Optional[Set[Tuple[str, int]]] = None, additional_sinks: Optional[Set[str]] = None) -> Tuple[str, Set[Tuple[str, int]]]:
         """Generate YAML representation of path with nested function calls.
         
         Args:
@@ -499,26 +503,69 @@ class TraceProcessor:
         
         # If there are more functions in path, add them as nested calls
         if len(path) > 1:
-            # Add callsites for the call to next function
-            dst = path[1]
-            sites = edge_sites.get((uid, dst), [])
-            if sites:
-                uniq = list(dict.fromkeys(sites))[:10]  # Limit to 10 callsites
-                out.append(f"{indent_str}  callsites:")
-                for f, ln in uniq:
-                    out.append(f"{indent_str}    - {f}:{ln}")
+            # Check if next element is a sink and we have additional sinks to show
+            next_uid = path[1]
+            is_next_sink = next_uid in nodes and nodes[next_uid].is_sink
             
-            # Recursively add next function(s) as nested calls
-            out.append(f"{indent_str}  calls:")
-            nested, shown_lines = self._path_to_yaml(path[1:], nodes, edge_sites, code_cache, indent + 1, show_code=show_code, shown_lines=shown_lines)
-            if nested:
-                out.append(nested)
+            # If this is the last function before sink(s), and we have additional sinks
+            if is_next_sink and additional_sinks and len(additional_sinks) > 1:
+                # Show all sinks as multiple calls from this function
+                out.append(f"{indent_str}  callsites:")
+                # Collect all callsites for all sinks
+                all_sites = []
+                for sink_uid in additional_sinks:
+                    sites = edge_sites.get((uid, sink_uid), [])
+                    all_sites.extend(sites)
+                
+                if all_sites:
+                    uniq = list(dict.fromkeys(all_sites))[:10]
+                    for f, ln in uniq:
+                        out.append(f"{indent_str}    - {f}:{ln}")
+                
+                out.append(f"{indent_str}  calls:")
+                # Show all sinks
+                for sink_uid in sorted(additional_sinks):
+                    sink_node = nodes.get(sink_uid)
+                    if sink_node:
+                        sink_label = self._label(sink_uid, nodes)
+                        sink_loc = self._format_loc(sink_node)
+                        
+                        label_escaped = sink_label.replace('"', '\\"').replace(':', '\\:')
+                        loc_escaped = sink_loc.replace('"', '\\"').replace(':', '\\:')
+                        
+                        if any(c in sink_label for c in ['[', ']', ':', '"', "'", '&', '*', '?', '|', '-', '<', '>', '=', '!', '%', '@', '`']):
+                            out.append(f'{indent_str}  - function: "{label_escaped}"')
+                        else:
+                            out.append(f"{indent_str}  - function: {sink_label}")
+                        
+                        if any(c in sink_loc for c in ['[', ']', ':', '"', "'", '&', '*', '?', '|', '-', '<', '>', '=', '!', '%', '@', '`']):
+                            out.append(f'{indent_str}    location: "{loc_escaped}"')
+                        else:
+                            out.append(f"{indent_str}    location: {sink_loc}")
+                        
+                        out.append(f"{indent_str}    tags: [SINK]")
+            else:
+                # Normal recursive call
+                # Add callsites for the call to next function
+                dst = path[1]
+                sites = edge_sites.get((uid, dst), [])
+                if sites:
+                    uniq = list(dict.fromkeys(sites))[:10]  # Limit to 10 callsites
+                    out.append(f"{indent_str}  callsites:")
+                    for f, ln in uniq:
+                        out.append(f"{indent_str}    - {f}:{ln}")
+                
+                # Recursively add next function(s) as nested calls
+                out.append(f"{indent_str}  calls:")
+                nested, shown_lines = self._path_to_yaml(path[1:], nodes, edge_sites, code_cache, indent + 1, show_code=show_code, shown_lines=shown_lines, additional_sinks=additional_sinks)
+                if nested:
+                    out.append(nested)
         
         return ("\n".join(out), shown_lines)
     
-    def _path_to_text(self, path: List[str], nodes: Dict[str, Node], edge_sites: DefaultDict[Tuple[str, str], List[Tuple[str, int]]], code_cache: Optional[Dict[str, str]] = None, show_code: bool = True) -> str:
+    def _path_to_text(self, path: List[str], nodes: Dict[str, Node], edge_sites: DefaultDict[Tuple[str, str], List[Tuple[str, int]]], code_cache: Optional[Dict[str, str]] = None, show_code: bool = True, additional_sinks: Optional[Set[str]] = None) -> str:
         """Generate YAML representation of path."""
-        yaml_text, _ = self._path_to_yaml(path, nodes, edge_sites, code_cache, indent=0, show_code=show_code)
+        yaml_text, _ = self._path_to_yaml(path, nodes, edge_sites, code_cache, indent=0, show_code=show_code, additional_sinks=additional_sinks)
         return yaml_text
 
     def _update_progress(self):
@@ -535,6 +582,13 @@ class TraceProcessor:
         self._traces_found += 1
         
         code_hash = self._get_path_code_hash(path, nodes)
+        
+        # Extract sink from path (last element if it's a sink)
+        sink_uid = None
+        if path:
+            last_uid = path[-1]
+            if last_uid in nodes and nodes[last_uid].is_sink:
+                sink_uid = last_uid
         
         # Build code cache for this path (only for functions, not sinks)
         # Note: We don't filter shown lines here - that will be done during rendering
@@ -553,6 +607,10 @@ class TraceProcessor:
             # Найден существующий трейс - добавляем новый путь в него
             existing_trace_id, existing_path = existing
             path_tuple = tuple(path)
+            
+            # Добавляем sink к существующему трейсу, если он отличается
+            if sink_uid:
+                self._trace_sinks[existing_trace_id].add(sink_uid)
             
             # Определяем, какой путь длиннее - используем более длинный как основной
             use_new_path = len(path) > len(existing_path)
@@ -610,6 +668,10 @@ class TraceProcessor:
             self._trace_counter += 1
             trace_id = self._trace_counter
             
+            # Добавляем sink к новому трейсу
+            if sink_uid:
+                self._trace_sinks[trace_id].add(sink_uid)
+            
             # Сохраняем хеш для будущих проверок
             if code_hash:
                 path_tuple = tuple(path)
@@ -634,11 +696,20 @@ class TraceProcessor:
         
         path, code_hash, code_cache = self._collected_traces[trace_id]
         
+        # Get additional sinks for this trace (excluding the one in path)
+        additional_sinks = self._trace_sinks.get(trace_id, set()).copy()
+        if path and path[-1] in additional_sinks:
+            # Keep all sinks, including the one in path
+            pass
+        elif path and path[-1] in nodes and nodes[path[-1]].is_sink:
+            # Add the sink from path to additional_sinks
+            additional_sinks.add(path[-1])
+        
         # Если нужно показать код, используем кэш
         if show_code and code_cache:
-            return self._path_to_text(path, nodes, edge_sites, code_cache=code_cache, show_code=True)
+            return self._path_to_text(path, nodes, edge_sites, code_cache=code_cache, show_code=True, additional_sinks=additional_sinks if len(additional_sinks) > 1 else None)
         else:
-            return self._path_to_text(path, nodes, edge_sites, code_cache=None, show_code=False)
+            return self._path_to_text(path, nodes, edge_sites, code_cache=None, show_code=False, additional_sinks=additional_sinks if len(additional_sinks) > 1 else None)
     
     def get_all_trace_ids(self) -> List[int]:
         """Get all collected trace IDs."""

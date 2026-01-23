@@ -22,53 +22,7 @@ from core2.graph_builder import SecurityGraph
 from core2.sinks import KNOWN_SINKS
 from core2.sources import is_php_source
 from core2.trace_processor import TraceProcessor
-
-
-class TraceSaver:
-    """Class for saving traces and reports to repository-specific folders."""
-    
-    def __init__(self, reports_dir: Path, repo_name: str):
-        """
-        Initialize TraceSaver.
-        
-        Args:
-            reports_dir: Base directory for reports (e.g., "reports")
-            repo_name: Name of the repository (will create reports_dir/repo_name/)
-        """
-        self.reports_dir = Path(reports_dir).resolve()
-        self.repo_dir = self.reports_dir / repo_name
-        self.repo_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"TraceSaver initialized: reports will be saved to {self.repo_dir}")
-    
-    def save_trace(self, trace_id: int, trace_text: str, trace_text_with_code: str):
-        """
-        Save trace files.
-        
-        Args:
-            trace_id: Unique trace identifier
-            trace_text: Trace text without code
-            trace_text_with_code: Trace text with code
-        """
-        (self.repo_dir / f"{trace_id}.txt").write_text(
-            trace_text, encoding="utf-8", errors="ignore"
-        )
-        (self.repo_dir / f"{trace_id}_code.txt").write_text(
-            trace_text_with_code, encoding="utf-8", errors="ignore"
-        )
-        logger.debug(f"Saved trace {trace_id} to {self.repo_dir}")
-    
-    def save_report(self, trace_id: int, report: dict):
-        """
-        Save LLM report.
-        
-        Args:
-            trace_id: Unique trace identifier
-            report: LLM response as dictionary
-        """
-        report_file = self.repo_dir / f"{trace_id}_report.json"
-        with open(report_file, "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=2, ensure_ascii=False)
-        logger.debug(f"Saved report {trace_id} to {report_file}")
+from tools.trace_deduplicate import TraceDeduplicator
 
 
 def analyze_repository(repo_path: Path, out_dir: Optional[Path], show_code: bool, visualize: bool):
@@ -154,22 +108,33 @@ def analyze_repository(repo_path: Path, out_dir: Optional[Path], show_code: bool
     # Run trace analysis
     graph.trace_all(show_code=show_code, out_dir=None)
     
-    # Save traces if out_dir is specified
+    # Save traces if out_dir is specified (simple YAML format, deduplication will be done later)
     if out_dir and graph.trace_processor:
-        trace_saver = TraceSaver(out_dir, repo_name)
+        reports_dir = Path(out_dir).resolve()
+        repo_dir = reports_dir / repo_name
+        repo_dir.mkdir(parents=True, exist_ok=True)
+        
         trace_ids = graph.trace_processor.get_all_trace_ids()
         
-        logger.info(f"Saving {len(trace_ids)} traces to {out_dir}/{repo_name}/...")
+        logger.info(f"Saving {len(trace_ids)} traces to {repo_dir}/...")
         for trace_id in trace_ids:
-            trace_text = graph.trace_processor.get_trace_text(
-                trace_id, graph.nodes, graph.edge_sites, show_code=False
-            )
             trace_text_with_code = graph.trace_processor.get_trace_text(
                 trace_id, graph.nodes, graph.edge_sites, show_code=True
             )
-            trace_saver.save_trace(trace_id, trace_text, trace_text_with_code)
+            (repo_dir / f"{trace_id}_code.txt").write_text(
+                trace_text_with_code, encoding="utf-8", errors="ignore"
+            )
         
-        logger.info(f"Saved {len(trace_ids)} traces")
+        logger.info(f"Saved {len(trace_ids)} traces to {repo_dir}")
+        
+        # Run deduplication and save to deduplicated subfolder
+        try:
+            logger.info("Starting trace deduplication...")
+            deduplicator = TraceDeduplicator(reports_dir, repo_name)
+            deduplicator.deduplicate()
+            logger.info("Trace deduplication complete")
+        except Exception as e:
+            logger.warning(f"Failed to deduplicate traces: {e}", exc_info=True)
 
     if visualize:
         graph.visualize()
