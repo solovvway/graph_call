@@ -185,14 +185,21 @@ class TraceProcessor:
         
         return (False, None, None)
 
-    def _node_code(self, nodes: Dict[str, Node], uid: str, max_lines: int = 400) -> str:
+    def _node_code(self, nodes: Dict[str, Node], uid: str, max_lines: int = 400, shown_lines: Optional[Set[Tuple[str, int]]] = None) -> Tuple[str, Tuple[int, int]]:
+        """
+        Extract code for a node, excluding already shown lines.
+        Returns (code, (start_line, end_line)) tuple.
+        """
         n = nodes[uid]
         if n.is_builtin or n.file in {"<external>", "unknown", "<builtin>"}:
-            return ""
+            return ("", (0, 0))
 
         lines = self._get_file_lines(n.file)
         if not lines:
-            return ""
+            return ("", (0, 0))
+
+        shown_lines = shown_lines or set()
+        file_key = n.file
 
         # Check if this is a class method - if so, extract entire class code
         is_method, class_name, method_name = self._is_class_method(uid, n.file)
@@ -202,29 +209,91 @@ class TraceProcessor:
             class_def = self._find_class_definition(n.file, class_name)
             if class_def:
                 class_start, class_end = class_def
-                # Extract entire class code
-                start = max(1, class_start)
-                end = min(len(lines), class_end)
                 
-                # Keep output bounded
-                if (end - start + 1) > max_lines:
-                    end = start + max_lines - 1
+                # Check if class is already fully shown
+                # Ensure class_end doesn't exceed file length
+                class_end_safe = min(class_end, len(lines))
+                class_all_shown = all((file_key, line_num) in shown_lines for line_num in range(class_start, class_end_safe + 1))
                 
-                snippet = lines[start - 1:end]
-                return "\n".join(snippet)
+                if class_all_shown:
+                    # Class already shown - show only method to avoid duplication
+                    # Fall through to method-only extraction below
+                    pass
+                else:
+                    # Class not fully shown - show entire class (or remaining parts)
+                    start = max(1, class_start)
+                    end = min(len(lines), class_end)
+                    
+                    # If start exceeds file length, return empty
+                    if start > len(lines):
+                        return ("", (class_start, class_end))
+                    
+                    # Keep output bounded
+                    if (end - start + 1) > max_lines:
+                        end = min(start + max_lines - 1, len(lines))
+                    
+                    # Filter out already shown lines
+                    filtered_lines = []
+                    actual_start = None
+                    actual_end = None
+                    for line_num in range(start, end + 1):
+                        # Check bounds - line_num is 1-based, lines is 0-based
+                        if line_num < 1 or line_num > len(lines):
+                            continue
+                        if (file_key, line_num) not in shown_lines:
+                            if actual_start is None:
+                                actual_start = line_num
+                            actual_end = line_num
+                            filtered_lines.append(lines[line_num - 1])
+                        elif actual_start is not None:
+                            # We've already started showing code, add empty line to indicate gap
+                            if filtered_lines and filtered_lines[-1].strip():
+                                filtered_lines.append("")
+                    
+                    if filtered_lines:
+                        return ("\n".join(filtered_lines), (actual_start or start, actual_end or end))
+                    else:
+                        # All lines already shown - return empty but with correct line range
+                        return ("", (start, end))
             # If class not found, fall through to method-only extraction
         
         # Default: extract method/function code only
         start = max(1, int(n.line or 1))
         end = int(n.end_line or n.line or start)
         end = max(start, end)
+        
+        # Ensure bounds don't exceed file length
+        if start > len(lines):
+            return ("", (start, end))
+        end = min(end, len(lines))
 
         # keep output bounded
         if (end - start + 1) > max_lines:
-            end = start + max_lines - 1
+            end = min(start + max_lines - 1, len(lines))
 
-        snippet = lines[start - 1:end]
-        return "\n".join(snippet)
+        # Filter out already shown lines
+        filtered_lines = []
+        actual_start = None
+        actual_end = None
+        for line_num in range(start, end + 1):
+            # Check bounds - line_num is 1-based, lines is 0-based
+            if line_num < 1 or line_num > len(lines):
+                continue
+            if (file_key, line_num) not in shown_lines:
+                if actual_start is None:
+                    actual_start = line_num
+                actual_end = line_num
+                filtered_lines.append(lines[line_num - 1])
+            elif actual_start is not None:
+                # We've already started showing code, add empty line to indicate gap
+                if filtered_lines and filtered_lines[-1].strip():
+                    filtered_lines.append("")
+        
+        if filtered_lines:
+            return ("\n".join(filtered_lines), (actual_start or start, actual_end or end))
+        else:
+            # All lines already shown - return empty but with correct line range
+            return ("", (start, end))
 
     def _get_path_code_hash(self, path: List[str], nodes: Dict[str, Node]) -> str:
         """
@@ -244,7 +313,7 @@ class TraceProcessor:
         # Собираем код всех функций
         codes = []
         for uid in function_uids:
-            code = self._node_code(nodes, uid)
+            code, _ = self._node_code(nodes, uid, shown_lines=None)
             if code:
                 codes.append(f"{uid}:{code}")
         
@@ -272,7 +341,7 @@ class TraceProcessor:
         code_hashes = set()
         
         for uid in function_uids:
-            code = self._node_code(nodes, uid)
+            code, _ = self._node_code(nodes, uid, shown_lines=None)
             if code:
                 # Создаем хеш для каждой функции отдельно
                 code_hash = hashlib.md5(f"{uid}:{code}".encode('utf-8')).hexdigest()
@@ -358,15 +427,20 @@ class TraceProcessor:
             loc = f"{n.file}:{n.line}-{n.end_line}"
         return loc
 
-    def _path_to_yaml(self, path: List[str], nodes: Dict[str, Node], edge_sites: DefaultDict[Tuple[str, str], List[Tuple[str, int]]], code_cache: Optional[Dict[str, str]] = None, indent: int = 0, show_code: bool = True) -> str:
+    def _path_to_yaml(self, path: List[str], nodes: Dict[str, Node], edge_sites: DefaultDict[Tuple[str, str], List[Tuple[str, int]]], code_cache: Optional[Dict[str, str]] = None, indent: int = 0, show_code: bool = True, shown_lines: Optional[Set[Tuple[str, int]]] = None) -> Tuple[str, Set[Tuple[str, int]]]:
         """Generate YAML representation of path with nested function calls.
         
         Args:
             show_code: If False, skip code blocks even if code_cache is provided
+            shown_lines: Set of (file, line_number) tuples for lines already shown
+        
+        Returns:
+            (yaml_string, updated_shown_lines)
         """
         if not path:
-            return ""
+            return ("", shown_lines or set())
         
+        shown_lines = shown_lines or set()
         out: List[str] = []
         indent_str = "  " * indent
         
@@ -402,12 +476,24 @@ class TraceProcessor:
             out.append(f"{indent_str}  tags: [{', '.join(tags)}]")
         
         # Add code if available and show_code is True
-        if show_code and code_cache and uid in code_cache:
-            code = code_cache[uid]
+        if show_code and not (n.is_builtin or n.file in {"<external>", "unknown", "<builtin>"}):
+            # Get code with filtering of already shown lines
+            code, (code_start, code_end) = self._node_code(nodes, uid, shown_lines=shown_lines)
+            
             if code:
+                # Update shown_lines with the lines we're about to show
+                file_key = n.file
+                for line_num in range(code_start, code_end + 1):
+                    shown_lines.add((file_key, line_num))
+                
                 # Escape code for YAML (use literal block scalar)
                 code_lines = code.split('\n')
                 out.append(f"{indent_str}  code: |")
+                # Add line range information
+                if code_start == code_end:
+                    out.append(f"{indent_str}    # Lines {code_start}")
+                else:
+                    out.append(f"{indent_str}    # Lines {code_start}-{code_end}")
                 for line in code_lines:
                     out.append(f"{indent_str}    {line}")
         
@@ -424,15 +510,16 @@ class TraceProcessor:
             
             # Recursively add next function(s) as nested calls
             out.append(f"{indent_str}  calls:")
-            nested = self._path_to_yaml(path[1:], nodes, edge_sites, code_cache, indent + 1, show_code=show_code)
+            nested, shown_lines = self._path_to_yaml(path[1:], nodes, edge_sites, code_cache, indent + 1, show_code=show_code, shown_lines=shown_lines)
             if nested:
                 out.append(nested)
         
-        return "\n".join(out)
+        return ("\n".join(out), shown_lines)
     
     def _path_to_text(self, path: List[str], nodes: Dict[str, Node], edge_sites: DefaultDict[Tuple[str, str], List[Tuple[str, int]]], code_cache: Optional[Dict[str, str]] = None, show_code: bool = True) -> str:
         """Generate YAML representation of path."""
-        return self._path_to_yaml(path, nodes, edge_sites, code_cache, indent=0, show_code=show_code)
+        yaml_text, _ = self._path_to_yaml(path, nodes, edge_sites, code_cache, indent=0, show_code=show_code)
+        return yaml_text
 
     def _update_progress(self):
         """Обновляет прогресс-бар на месте"""
@@ -450,11 +537,12 @@ class TraceProcessor:
         code_hash = self._get_path_code_hash(path, nodes)
         
         # Build code cache for this path (only for functions, not sinks)
+        # Note: We don't filter shown lines here - that will be done during rendering
         code_cache: Dict[str, str] = {}
         if self.show_code:
             for uid in path:
                 if uid not in code_cache:
-                    code = self._node_code(nodes, uid)
+                    code, _ = self._node_code(nodes, uid, shown_lines=None)
                     if code:
                         code_cache[uid] = code
         
