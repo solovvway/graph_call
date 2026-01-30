@@ -143,7 +143,7 @@ def analyze_repository(repo_path: Path, out_dir: Optional[Path], show_code: bool
     if repo_sources.exists():
         logger.info(f"Found repository-specific sources.json in {repo_path}")
     
-    graph = SecurityGraph(repo_path=repo_path)
+    graph = SecurityGraph()
     files_map: Dict[str, List[Path]] = defaultdict(list)
 
     for root, _, files in os.walk(repo_path):
