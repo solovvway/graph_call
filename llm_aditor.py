@@ -11,9 +11,9 @@ from typing import List, Dict, Optional, Set, Tuple
 from collections import defaultdict
 
 # Import from core2 and auditor
-from core2.ast_core import CodeParser, EXT_TO_LANG, Node, Edge
-from core2.graph_builder import SecurityGraph
-from core2.sinks import KNOWN_SINKS
+from dev_core2.ast_core import CodeParser, EXT_TO_LANG, Node, Edge
+from dev_core2.graph_builder import SecurityGraph
+from dev_core2.sinks import KNOWN_SINKS
 from auditor import TraceSaver
 
 import openai

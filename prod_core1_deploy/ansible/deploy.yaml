@@ -1,0 +1,26 @@
+---
+# Развёртывание SAST Job в кластере.
+# Запуск из папки prod_core1_deploy:
+#   ansible-playbook -i ansible/inventory ansible/deploy.yaml -e "scan_id=UUID repo_zip_url=URL"
+#
+# Требуется: kubectl, настроенный доступ к кластеру (KUBECONFIG или ~/.kube/config).
+- name: Deploy SAST Job to Kubernetes
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    job_name: "sast-scan-{{ scan_id | default('default') }}"
+    image_name: "{{ sast_image | default('sast-job:latest') }}"
+    namespace: "{{ k8s_namespace | default('default') }}"
+    job_manifest: "{{ playbook_dir }}/../job.yaml"
+  tasks:
+    - name: Apply SAST Job manifest
+      ansible.builtin.command:
+        cmd: "kubectl apply -f {{ job_manifest }} -n {{ namespace }}"
+      register: kubectl_apply
+      changed_when: "'configured' in kubectl_apply.stdout or 'created' in kubectl_apply.stdout"
+
+    - name: Show result
+      ansible.builtin.debug:
+        msg: "{{ kubectl_apply.stdout_lines }}"
+      when: kubectl_apply.stdout_lines is defined

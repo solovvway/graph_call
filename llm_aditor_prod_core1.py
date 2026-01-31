@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-LLM auditor with sources.json agent: only core4-agent-config.
-Optionally generates sources.json via LLM agent before scanning (--gen-sources).
-Config (repos_path, base_url, api_key, etc.) is read from JSON; sources.json is generated per repo or used if present.
+LLM auditor for prod_core1: sync sources.json via agent, async trace evaluation.
+Optionally generates sources.json via LLM agent (--gen-sources). After saving reports,
+optionally uploads to MinIO (--upload-minio or when MINIO_ENDPOINT is set).
 """
 import os
 import sys
@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from collections import defaultdict
 
-# Resolve project root
 _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
@@ -28,11 +27,9 @@ import openai
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
-# Core4-agent-config package name (hyphen -> underscore)
-CORE4_PACKAGE = "dev_core4_agent_config"
-CORE4_DIR = _SCRIPT_DIR / "dev_core4_agent_config"
+PROD_CORE1_PACKAGE = "prod_core1"
+PROD_CORE1_DIR = _SCRIPT_DIR / "prod_core1"
 
-# Will be set by load_core4()
 CodeParser = None
 EXT_TO_LANG = None
 Node = None
@@ -42,39 +39,37 @@ KNOWN_SINKS = None
 run_sources_agent = None
 
 
-def load_core4():
-    """Load only core4-agent-config: ast_core, graph_builder, sinks, sources, trace_processor, and agent run_agent."""
+def load_prod_core1():
+    """Load prod_core1: ast_core, graph_builder, sinks, sources, trace_processor, agent run_agent."""
     global CodeParser, EXT_TO_LANG, Node, Edge, SecurityGraph, KNOWN_SINKS, run_sources_agent
 
-    if not CORE4_DIR.is_dir():
-        raise FileNotFoundError(f"core4-agent-config not found: {CORE4_DIR}")
+    if not PROD_CORE1_DIR.is_dir():
+        raise FileNotFoundError(f"prod_core1 not found: {PROD_CORE1_DIR}")
 
-    if CORE4_PACKAGE not in sys.modules:
-        fake_package = types.ModuleType(CORE4_PACKAGE)
-        fake_package.__path__ = [str(CORE4_DIR)]
-        fake_package.__file__ = str(CORE4_DIR / "__init__.py")
-        sys.modules[CORE4_PACKAGE] = fake_package
+    if PROD_CORE1_PACKAGE not in sys.modules:
+        fake_package = types.ModuleType(PROD_CORE1_PACKAGE)
+        fake_package.__path__ = [str(PROD_CORE1_DIR)]
+        fake_package.__file__ = str(PROD_CORE1_DIR / "__init__.py")
+        sys.modules[PROD_CORE1_PACKAGE] = fake_package
 
     def load_module(module_name: str, file_path: Path):
-        full_name = f"{CORE4_PACKAGE}.{module_name}"
+        full_name = f"{PROD_CORE1_PACKAGE}.{module_name}"
         spec = importlib.util.spec_from_file_location(full_name, file_path)
         if spec is None or spec.loader is None:
             raise ImportError(f"Cannot load {module_name} from {file_path}")
         mod = importlib.util.module_from_spec(spec)
-        mod.__package__ = CORE4_PACKAGE
+        mod.__package__ = PROD_CORE1_PACKAGE
         mod.__name__ = full_name
         sys.modules[full_name] = mod
         spec.loader.exec_module(mod)
         return mod
 
-    ast_core = load_module("ast_core", CORE4_DIR / "ast_core.py")
-    sinks_mod = load_module("sinks", CORE4_DIR / "sinks.py")
-    load_module("sources", CORE4_DIR / "sources.py")
-    trace_processor = load_module("trace_processor", CORE4_DIR / "trace_processor.py")
-    graph_builder = load_module("graph_builder", CORE4_DIR / "graph_builder.py")
-
-    # Agent module: file is agent-config.py, import as agent_config
-    agent_mod = load_module("agent_config", CORE4_DIR / "agent-config.py")
+    ast_core = load_module("ast_core", PROD_CORE1_DIR / "ast_core.py")
+    sinks_mod = load_module("sinks", PROD_CORE1_DIR / "sinks.py")
+    load_module("sources", PROD_CORE1_DIR / "sources.py")
+    load_module("trace_processor", PROD_CORE1_DIR / "trace_processor.py")
+    graph_builder = load_module("graph_builder", PROD_CORE1_DIR / "graph_builder.py")
+    agent_mod = load_module("agent_config", PROD_CORE1_DIR / "agent-config.py")
 
     CodeParser = ast_core.CodeParser
     EXT_TO_LANG = ast_core.EXT_TO_LANG
@@ -84,9 +79,8 @@ def load_core4():
     KNOWN_SINKS = sinks_mod.KNOWN_SINKS
     run_sources_agent = getattr(agent_mod, "run_agent", None)
     if run_sources_agent is None:
-        logger.warning("core4-agent-config agent run_agent not found; --gen-sources will be no-op")
-
-    logger.info("Loaded core4-agent-config")
+        logger.warning("prod_core1 run_agent not found; --gen-sources will be no-op")
+    logger.info("Loaded prod_core1")
 
 
 def load_config(config_path: Path) -> dict:
@@ -182,26 +176,22 @@ class LLMClient:
 
 
 def ensure_sources_json(repo_path: Path, config: dict, config_prompt_path: Path) -> bool:
-    """Generate sources.json for repo if missing or --gen-sources. Returns True if sources.json is present (existing or generated)."""
+    """Generate sources.json for repo if missing or --gen-sources. Sync OpenAI. Returns True if present."""
     sources_file = repo_path / "sources.json"
     if sources_file.exists():
         return True
-
     if not run_sources_agent:
         logger.warning("Sources agent not available; run without --gen-sources or add sources.json manually")
         return False
-
     base_url = config.get("base_url")
     api_key = config.get("api_key")
     if not base_url or not api_key:
         logger.warning("base_url and api_key required in config for --gen-sources")
         return False
-
     prompt_text = ""
     if config_prompt_path.exists():
         prompt_text = config_prompt_path.read_text(encoding="utf-8", errors="ignore").strip()
-
-    logger.info("Generating sources.json for %s via agent...", repo_path.name)
+    logger.info("Generating sources.json for %s via agent (sync)...", repo_path.name)
     result = run_sources_agent(
         repo_path=repo_path,
         prompt_text=prompt_text,
@@ -267,7 +257,7 @@ async def analyze_repository(
         return
 
     trace_ids = graph.trace_processor.get_all_trace_ids()
-    logger.info("Found %d traces, analyzing with LLM...", len(trace_ids))
+    logger.info("Found %d traces, analyzing with LLM (async)...", len(trace_ids))
     save_no_vuln = config.get("save_no_vuln_traces", False)
 
     async def analyze_one(tid):
@@ -302,13 +292,24 @@ async def _analyze_trace_async(
         trace_saver.save_report(trace_id, result)
 
 
+def upload_repo_reports_to_minio(reports_dir: Path, repo_name: str) -> int:
+    """Upload reports_dir/repo_name to MinIO bucket named after repo. Returns count uploaded."""
+    try:
+        from tools.minio_upload import upload_reports_to_minio
+        return upload_reports_to_minio(reports_dir, repo_name)
+    except Exception as e:
+        logger.error("MinIO upload failed for %s: %s", repo_name, e)
+        return 0
+
+
 async def async_main():
-    parser = argparse.ArgumentParser(description="LLM SAST with core4-agent-config; optional --gen-sources")
+    parser = argparse.ArgumentParser(description="LLM SAST with prod_core1; optional --gen-sources, --upload-minio")
     parser.add_argument("--config", required=True, help="Path to JSON config (repos_path, base_url, api_key, ...)")
     parser.add_argument("--gen-sources", action="store_true", help="Generate sources.json per repo via agent if missing")
+    parser.add_argument("--upload-minio", action="store_true", help="Upload reports to MinIO after each repo (or set MINIO_ENDPOINT)")
     args = parser.parse_args()
 
-    load_core4()
+    load_prod_core1()
 
     config_path = Path(args.config).resolve()
     try:
@@ -341,8 +342,7 @@ async def async_main():
     except FileNotFoundError:
         system_prompt, user_template = "", ""
 
-    streams = config.get("streams")
-    max_concurrent = streams if streams is not None else config.get("max_concurrent", LLMClient.DEFAULT_MAX_CONCURRENT)
+    max_concurrent = config.get("max_concurrent", LLMClient.DEFAULT_MAX_CONCURRENT)
     llm_client = LLMClient(
         base_url=base_url,
         api_key=api_key,
@@ -365,6 +365,8 @@ async def async_main():
         sys.exit(1)
     logger.info("Repositories: %d", len(repositories))
 
+    do_minio = args.upload_minio or bool(os.environ.get("MINIO_ENDPOINT"))
+
     for repo_path in repositories:
         if not repo_path.exists():
             continue
@@ -376,6 +378,8 @@ async def async_main():
             await analyze_repository(repo_path, config, llm_client, trace_saver, config.get("enable_js", False))
         except Exception as e:
             logger.error("Error analyzing %s: %s", repo_name, e, exc_info=True)
+        if do_minio:
+            upload_repo_reports_to_minio(reports_dir, repo_name)
 
     logger.info("Analysis complete")
 

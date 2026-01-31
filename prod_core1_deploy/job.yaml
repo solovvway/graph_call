@@ -1,0 +1,60 @@
+# Build: docker build -f k8s-sast-job/Dockerfile -t <registry>/sast-job:latest .
+# Push and apply: kubectl apply -f k8s-sast-job/job.yaml
+# Override env with ConfigMap/Secret or set in spec.template.spec.containers[0].env
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sast-scan
+  labels:
+    app: sast-scan
+spec:
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app: sast-scan
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: sast
+          image: sast-job:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: SCAN_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: REPO_ZIP_URL
+              value: "https://example.com/repo.zip"
+            - name: RABBITMQ_URL
+              valueFrom:
+                secretKeyRef:
+                  name: sast-secrets
+                  key: rabbitmq-url
+            - name: MINIO_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: sast-secrets
+                  key: minio-endpoint
+            - name: MINIO_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: sast-secrets
+                  key: minio-access-key
+            - name: MINIO_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: sast-secrets
+                  key: minio-secret-key
+            - name: CONFIG_PATH
+              value: "/app/config.json"
+            - name: GEN_SOURCES
+              value: "false"
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "500m"
+            limits:
+              memory: "4Gi"
+              cpu: "2"

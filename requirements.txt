@@ -5,3 +5,7 @@ tree-sitter-languages==1.10.2
 graphviz
 pyyaml
 openai
+yandex-cloud-ml-sdk
+minio
+pika
+requests
