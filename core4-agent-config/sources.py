@@ -138,15 +138,40 @@ def load_sources_config(repo_path: Optional[Path] = None) -> Optional[Dict[str, 
         return None
 
 
+def _path_matches_pattern(path_obj: Path, pattern: str, repo_path: Optional[Path] = None) -> bool:
+    """Match path against glob pattern. Path is normalized relative to repo_path so patterns like 'moonraker/components/**/*.py' work."""
+    path_resolved = path_obj.resolve()
+    # Use path relative to repo so pattern "moonraker/components/**/*.py" matches
+    if repo_path:
+        try:
+            path_rel = path_resolved.relative_to(Path(repo_path).resolve())
+        except ValueError:
+            path_rel = path_resolved
+    else:
+        path_rel = path_resolved
+    # Normalize to posix-style for consistent matching
+    path_str = path_rel.as_posix()
+    pattern_posix = pattern.replace(os.sep, "/")
+    # pathlib.Path.match() supports ** (multiple path segments) in Python 3.11+
+    try:
+        return path_rel.match(pattern_posix)
+    except TypeError:
+        pass
+    # Fallback: ** means zero or more path segments
+    if "**" in pattern_posix:
+        import re as re_mod
+        # ** = (?:[^/]+/)* = zero or more path segments; * = [^/]* = no slash
+        re_pat = re_mod.escape(pattern_posix)
+        re_pat = re_pat.replace(r"\*\*", r"(?:[^/]+/)*").replace(r"\*", r"[^/]*").replace(r"\?", r".")
+        return bool(re_mod.fullmatch(re_pat, path_str))
+    return fnmatch(path_str, pattern_posix) or fnmatch(path_obj.name, pattern_posix)
+
+
 def is_valid_source_file(file_path: str, language: str, repo_path: Optional[Path] = None) -> bool:
     """
     Check if a file matches any of the file patterns in the config.
     Returns True if file matches, False otherwise.
-    
-    Args:
-        file_path: Path to the file to check
-        language: Language of the file
-        repo_path: Optional path to repository root for repository-specific config
+    Paths are matched relative to repo_path so patterns like 'moonraker/components/**/*.py' work.
     """
     config = load_sources_config(repo_path)
     if not config:
@@ -157,7 +182,7 @@ def is_valid_source_file(file_path: str, language: str, repo_path: Optional[Path
         return True  # No file patterns means files are not filtered
     
     # Check cache first
-    cache_key = f"{file_path}:{language}"
+    cache_key = f"{file_path}:{language}:{repo_path}"
     if cache_key in _FILE_PATTERN_CACHE:
         return _FILE_PATTERN_CACHE[cache_key]
     
@@ -172,28 +197,9 @@ def is_valid_source_file(file_path: str, language: str, repo_path: Optional[Path
         if pattern_lang and pattern_lang != language:
             continue
         
-        # Convert glob pattern to path matching
-        # Handle **/ prefix for recursive matching
-        if pattern.startswith("**/"):
-            pattern_suffix = pattern[3:]  # Remove "**/"
-            # Normalize pattern suffix to use OS-specific path separator
-            pattern_suffix_normalized = pattern_suffix.replace("/", os.sep)
-            # Check if file ends with the pattern suffix
-            if str(path_obj).endswith(pattern_suffix_normalized):
-                result = True
-                break
-            # Also check if any parent directory matches
-            for parent in path_obj.parents:
-                if fnmatch(str(parent / path_obj.name), pattern):
-                    result = True
-                    break
-            if result:
-                break
-        else:
-            # Simple pattern matching
-            if fnmatch(str(path_obj), pattern) or fnmatch(path_obj.name, pattern):
-                result = True
-                break
+        if _path_matches_pattern(path_obj, pattern, repo_path):
+            result = True
+            break
     
     _FILE_PATTERN_CACHE[cache_key] = result
     return result

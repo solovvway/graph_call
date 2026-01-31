@@ -30,6 +30,23 @@ TraceProcessor = None
 from tools.trace_deduplicate import TraceDeduplicator
 
 
+class TraceSaver:
+    """Saves trace text and LLM report per trace to reports_dir/repo_name/."""
+
+    def __init__(self, reports_dir, repo_name: str):
+        self.repo_dir = Path(reports_dir).resolve() / repo_name
+        self.repo_dir.mkdir(parents=True, exist_ok=True)
+
+    def save_trace(self, trace_id: int, trace_text_no_code: str, trace_text: str):
+        (self.repo_dir / f"{trace_id}.txt").write_text(trace_text_no_code, encoding="utf-8")
+        (self.repo_dir / f"{trace_id}_code.txt").write_text(trace_text, encoding="utf-8")
+
+    def save_report(self, trace_id: int, result: dict):
+        (self.repo_dir / f"{trace_id}_report.json").write_text(
+            json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+
+
 def load_core_module(core_name: str):
     """
     Dynamically load modules from the specified core (core1, core2, or core3-fast).

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-SAST config agent: builds a JSON config for llm_aditor via LLM with tools.
+SAST sources.json agent: builds sources.json (forward validation config) via LLM with tools.
 Before scanning, the model receives ls (depth 2) of the repo and instructions;
-it uses tools (list_dir, read_file, read_lines, grep, get_languages, file_info, submit_config)
-to produce a valid config. Config is validated; on failure the agent is asked to retry (1-2 times).
+it uses tools (list_dir, read_file, read_lines, grep, get_languages, file_info, submit_sources_config)
+to produce a valid sources.json. Config is validated; on failure the agent is asked to retry (1-2 times).
+LLM/scan connection config is created by the user manually; this agent outputs only sources.json.
 """
 import os
 import sys
@@ -310,66 +311,114 @@ def build_tools_schema() -> List[Dict]:
         {
             "type": "function",
             "function": {
-                "name": "submit_config",
-                "description": "Submit the final scan config. Call this when config is ready. All required fields must be set.",
+                "name": "submit_sources_config",
+                "description": "Submit the final sources.json for forward validation. Call when config is ready. At least one of file_patterns, function_patterns, function_names, or language_specific recommended.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "repos_path": {"type": "string", "description": "Path to dir containing repos (required)"},
-                        "base_url": {"type": "string", "description": "LLM API base URL (required)"},
-                        "api_key": {"type": "string", "description": "LLM API key (required)"},
-                        "reports_dir": {"type": "string"},
-                        "folder_id": {"type": "string"},
-                        "model": {"type": "string"},
-                        "debug": {"type": "boolean"},
-                        "enable_js": {"type": "boolean"},
-                        "temperature": {"type": "number"},
-                        "streams": {"type": "integer"},
-                        "max_concurrent": {"type": "integer"},
-                        "save_no_vuln_traces": {"type": "boolean"},
-                        "prompt_path": {"type": "string"},
-                        "exclude_dirs": {"type": "array", "items": {"type": "string"}},
-                        "include_extensions": {"type": "array", "items": {"type": "string"}},
-                        "max_file_size_kb": {"type": "integer"},
-                        "sources_config_path": {"type": "string"},
+                        "file_patterns": {
+                            "type": "array",
+                            "description": "Glob file patterns. Each item: { pattern: string, language?: string }",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "pattern": {"type": "string"},
+                                    "language": {"type": "string"},
+                                },
+                                "required": ["pattern"],
+                            },
+                        },
+                        "function_patterns": {
+                            "type": "array",
+                            "description": "Regex patterns for full function name",
+                            "items": {"type": "string"},
+                        },
+                        "function_names": {
+                            "type": "array",
+                            "description": "Exact function names or suffixes",
+                            "items": {"type": "string"},
+                        },
+                        "source_indicators": {
+                            "type": "array",
+                            "description": "Substrings that must appear in code",
+                            "items": {"type": "string"},
+                        },
+                        "language_specific": {
+                            "type": "object",
+                            "description": "Keys: language (python, javascript, etc). Values: { patterns: string[] } regex on code",
+                        },
                     },
-                    "required": ["repos_path", "base_url", "api_key"],
                 },
             },
         },
     ]
 
 
-def validate_config(config: Dict[str, Any], repo_path: Path) -> Tuple[bool, List[str]]:
+def validate_sources_config(config: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    """Validate sources.json structure. Returns (ok, list of error strings)."""
     errors: List[str] = []
-    for key in ("repos_path", "base_url", "api_key"):
-        val = config.get(key)
-        if val is None or (isinstance(val, str) and not val.strip()):
-            errors.append(f"Missing or empty required: {key}")
-    if config.get("repos_path"):
-        rp = Path(config["repos_path"]).resolve()
-        if not rp.exists():
-            errors.append(f"repos_path does not exist: {rp}")
-        elif not rp.is_dir():
-            errors.append(f"repos_path is not a directory: {rp}")
-    if config.get("base_url") is not None and not str(config["base_url"]).strip():
-        errors.append("base_url must be non-empty")
-    t = config.get("temperature")
-    if t is not None:
-        try:
-            v = float(t)
-            if v < 0 or v > 2:
-                errors.append("temperature must be between 0 and 2")
-        except (TypeError, ValueError):
-            errors.append("temperature must be a number")
-    mc = config.get("max_concurrent") or config.get("streams")
-    if mc is not None:
-        try:
-            v = int(mc)
-            if v < 1:
-                errors.append("max_concurrent/streams must be >= 1")
-        except (TypeError, ValueError):
-            errors.append("max_concurrent/streams must be an integer")
+    file_patterns = config.get("file_patterns")
+    if file_patterns is not None:
+        if not isinstance(file_patterns, list):
+            errors.append("file_patterns must be an array")
+        else:
+            for i, item in enumerate(file_patterns):
+                if not isinstance(item, dict):
+                    errors.append(f"file_patterns[{i}] must be an object")
+                elif not (item.get("pattern") and isinstance(item.get("pattern"), str) and item["pattern"].strip()):
+                    errors.append(f"file_patterns[{i}] must have non-empty 'pattern' string")
+
+    function_patterns = config.get("function_patterns")
+    if function_patterns is not None:
+        if not isinstance(function_patterns, list):
+            errors.append("function_patterns must be an array")
+        else:
+            for i, pat in enumerate(function_patterns):
+                if not isinstance(pat, str) or not pat.strip():
+                    errors.append(f"function_patterns[{i}] must be non-empty string")
+                else:
+                    try:
+                        re.compile(pat)
+                    except re.error as e:
+                        errors.append(f"function_patterns[{i}] invalid regex: {e}")
+
+    function_names = config.get("function_names")
+    if function_names is not None and not isinstance(function_names, list):
+        errors.append("function_names must be an array")
+
+    source_indicators = config.get("source_indicators")
+    if source_indicators is not None and not isinstance(source_indicators, list):
+        errors.append("source_indicators must be an array")
+
+    language_specific = config.get("language_specific")
+    if language_specific is not None:
+        if not isinstance(language_specific, dict):
+            errors.append("language_specific must be an object")
+        else:
+            for lang, val in language_specific.items():
+                if not isinstance(val, dict):
+                    errors.append(f"language_specific.{lang} must be an object")
+                elif "patterns" not in val or not isinstance(val["patterns"], list):
+                    errors.append(f"language_specific.{lang} must have 'patterns' array")
+                else:
+                    for j, pat in enumerate(val["patterns"]):
+                        if not isinstance(pat, str) or not pat.strip():
+                            errors.append(f"language_specific.{lang}.patterns[{j}] must be non-empty string")
+                        else:
+                            try:
+                                re.compile(pat)
+                            except re.error as e:
+                                errors.append(f"language_specific.{lang}.patterns[{j}] invalid regex: {e}")
+
+    # Optional: recommend at least one block for precision (non-blocking warning only)
+    has_any = (
+        (file_patterns and len(file_patterns) > 0)
+        or (function_patterns and len(function_patterns) > 0)
+        or (function_names and len(function_names) > 0)
+        or (language_specific and len(language_specific) > 0)
+    )
+    if not has_any and not errors:
+        logger.warning("No file_patterns/function_patterns/function_names/language_specific set; forward validation may be permissive")
     return (len(errors) == 0, errors)
 
 
@@ -384,12 +433,12 @@ def run_agent(
     repo_path = repo_path.resolve()
     ls_text = ls_depth(repo_path, 2)
     system = (
-        "You build a config for the SAST scanner. Use only the tools. "
-        "End by calling submit_config with the complete config. Do not output JSON in chat."
+        "You build sources.json for forward validation: only web entrypoints (routes, handlers, API). "
+        "Use only the tools. End by calling submit_sources_config with the config. Do not output JSON in chat."
     )
     user_content = (
         f"Repo (ls depth 2):\n{ls_text}\n\nInstructions:\n{prompt_text}\n\n"
-        "Explore if needed, then call submit_config with the config (required: repos_path, base_url, api_key)."
+        "Find routes/handlers/API, then call submit_sources_config with file_patterns, function_patterns, function_names, source_indicators, or language_specific."
     )
     messages: List[Dict] = [
         {"role": "system", "content": system},
@@ -417,7 +466,7 @@ def run_agent(
                 messages.append({"role": "assistant", "content": msg.content or ""})
             if step == 0:
                 messages.append(
-                    {"role": "user", "content": "You must use tools and then call submit_config to submit the config."}
+                    {"role": "user", "content": "You must use tools and then call submit_sources_config to submit the sources.json config."}
                 )
                 continue
             break
@@ -466,23 +515,18 @@ def run_agent(
                 result = tool_get_languages()
             elif name == "file_info":
                 result = tool_file_info(repo_path, args.get("path", ""))
-            elif name == "submit_config":
-                known = {
-                    "repos_path", "base_url", "api_key", "reports_dir", "folder_id", "model",
-                    "debug", "enable_js", "temperature", "streams", "max_concurrent",
-                    "save_no_vuln_traces", "prompt_path", "exclude_dirs", "include_extensions",
-                    "max_file_size_kb", "sources_config_path",
-                }
-                config = {k: v for k, v in args.items() if k in known}
-                ok, errs = validate_config(config, repo_path)
+            elif name == "submit_sources_config":
+                known = {"file_patterns", "function_patterns", "function_names", "source_indicators", "language_specific"}
+                config = {k: v for k, v in args.items() if k in known and v is not None}
+                ok, errs = validate_sources_config(config)
                 if ok:
                     return config
                 submit_retries += 1
                 result = "Validation failed: " + "; ".join(errs)
                 if submit_retries >= MAX_SUBMIT_CONFIG_RETRIES:
-                    result += ". Max retries reached; fix the errors and call submit_config again."
+                    result += ". Max retries reached; fix the errors and call submit_sources_config again."
                 else:
-                    result += ". Fix and call submit_config again."
+                    result += ". Fix and call submit_sources_config again."
             else:
                 result = f"Unknown tool: {name}"
             messages.append(
@@ -496,9 +540,9 @@ def run_agent(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Build SAST scan config via LLM agent")
+    parser = argparse.ArgumentParser(description="Build sources.json (forward validation config) via LLM agent")
     parser.add_argument("--repo", required=True, help="Path to repository (or dir containing repos)")
-    parser.add_argument("--output", required=True, help="Output JSON config path")
+    parser.add_argument("--output", required=True, help="Output path for sources.json")
     parser.add_argument("--config-prompt", default=None, help="Path to config prompt (default: prompts/config.md)")
     parser.add_argument("--base-url", required=True, help="LLM API base URL (for agent)")
     parser.add_argument("--api-key", required=True, help="LLM API key (for agent)")
@@ -529,14 +573,14 @@ def main() -> int:
         model=args.model,
     )
     if not config:
-        logger.error("Agent did not produce a valid config")
+        logger.error("Agent did not produce a valid sources.json config")
         return 1
 
     out_path = Path(args.output).resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
-    logger.info("Config written to %s", out_path)
+    logger.info("sources.json written to %s", out_path)
     print(out_path)
     return 0
 
