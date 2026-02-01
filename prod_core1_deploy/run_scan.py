@@ -11,6 +11,7 @@ import zipfile
 import tempfile
 import re
 import logging
+import pika
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -35,14 +36,14 @@ def send_status(ch, scan_id: str, status: str):
 
 
 def send_final_result(ch, scan_id: str, vulns: list):
-    """Declare 'out' queue and publish ScanResult."""
-    ch.queue_declare(queue="out", durable=True)
+    """Declare 'tasks.out' queue and publish ScanResult."""
+    ch.queue_declare(queue="tasks.out", durable=True)
     body = json.dumps({"id": scan_id, "vulns": vulns})
     ch.basic_publish(
-        exchange="", routing_key="out", body=body,
+        exchange="", routing_key="tasks.out", body=body,
         properties=pika.BasicProperties(content_type="application/json", delivery_mode=2)
     )
-    logger.info("Sent final result to out queue: %d vulns", len(vulns))
+    logger.info("Sent final result to tasks.out queue: %d vulns", len(vulns))
 
 
 def _file_from_trace(repo_dir: Path, trace_id: int) -> str:
@@ -115,21 +116,42 @@ def download_and_extract_repo(url: str, repos_base: Path) -> str:
         Path(zip_path).unlink(missing_ok=True)
 
 
-def run_analysis(repos_path: Path, reports_dir: Path, config_path: Path, gen_sources: bool):
+def run_analysis(repos_path: Path, reports_dir: Path, config_path: Path, gen_sources: bool, status_cbk=None):
     """Run prod_core1 orchestrator (sync sources + async trace eval)."""
     import asyncio
-    # Patch config on disk so repos_path and reports_dir are correct
+    
+    # Load base config
     config = json.loads(config_path.read_text(encoding="utf-8"))
+    
+    # Inject config from SCAN_CONFIG env var if present
+    scan_config_env = os.environ.get("SCAN_CONFIG")
+    if scan_config_env:
+        try:
+            scan_config = json.loads(scan_config_env)
+            # Only update specific keys as allowed
+            if "config" in scan_config and isinstance(scan_config["config"], dict):
+                inner_config = scan_config["config"]
+                if "enable_js" in inner_config:
+                    config["enable_js"] = inner_config["enable_js"]
+                if "exclude_dirs" in inner_config:
+                    config["exclude_dirs"] = inner_config["exclude_dirs"]
+            logger.info("Injected config from SCAN_CONFIG")
+        except Exception as e:
+            logger.warning("Failed to parse SCAN_CONFIG: %s", e)
+
     config["repos_path"] = str(repos_path)
     config["reports_dir"] = str(reports_dir)
     config_path.write_text(json.dumps(config, indent=2, ensure_ascii=False))
 
-    sys.argv = ["llm_aditor_prod_core1.py", "--config", str(config_path), "--upload-minio"]
+    # Prepare args for async_main (argparse)
+    sys.argv = ["llm_aditor_prod_core1.py", "--config", str(config_path)]
     if gen_sources:
         sys.argv.append("--gen-sources")
+    # Note: --upload-minio REMOVED here, we do it explicitly later
+
     os.chdir(APP_ROOT)
     from llm_aditor_prod_core1 import async_main
-    asyncio.run(async_main())
+    asyncio.run(async_main(status_callback=status_cbk))
 
 
 def main():

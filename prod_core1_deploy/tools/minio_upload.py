@@ -25,10 +25,11 @@ def upload_reports_to_minio(
     access_key: Optional[str] = None,
     secret_key: Optional[str] = None,
     secure: bool = True,
+    bucket_name: Optional[str] = None,
 ) -> int:
     """
-    Create a MinIO bucket named after the repo (normalized) and upload all files
-    from reports_dir/repo_name into it. Object names preserve relative path.
+    Create a MinIO bucket named after the repo (normalized) or use provided bucket_name,
+    and upload all files from reports_dir/repo_name into it. Object names preserve relative path.
 
     Args:
         reports_dir: Base reports directory (e.g. reports).
@@ -37,6 +38,7 @@ def upload_reports_to_minio(
         access_key: MinIO access key. Default: MINIO_ACCESS_KEY env.
         secret_key: MinIO secret key. Default: MINIO_SECRET_KEY env.
         secure: Use HTTPS. Default: MINIO_SECURE env or True.
+        bucket_name: Optional explicit bucket name. If not provided, derived from repo_name.
 
     Returns:
         Number of objects uploaded.
@@ -64,7 +66,12 @@ def upload_reports_to_minio(
         logger.warning("Reports directory does not exist: %s", repo_dir)
         return 0
 
-    bucket_name = _normalize_bucket_name(repo_name)
+    if bucket_name:
+        # Use provided bucket name as-is (but ensure it follows MinIO rules if possible, though trusting caller here)
+        pass
+    else:
+        bucket_name = _normalize_bucket_name(repo_name)
+    
     client = Minio(endpoint, access_key=access_key, secret_key=secret_key, secure=secure)
 
     if not client.bucket_exists(bucket_name):
@@ -98,6 +105,7 @@ def main():
     ap.add_argument("--endpoint", default=None, help="MinIO endpoint (default: MINIO_ENDPOINT)")
     ap.add_argument("--access-key", default=None, help="MinIO access key (default: MINIO_ACCESS_KEY)")
     ap.add_argument("--secret-key", default=None, help="MinIO secret key (default: MINIO_SECRET_KEY)")
+    ap.add_argument("--bucket", default=None, help="Explicit bucket name (overrides repo-based name)")
     ap.add_argument("--insecure", action="store_true", help="Use HTTP for MinIO")
     args = ap.parse_args()
 
@@ -109,6 +117,7 @@ def main():
         access_key=args.access_key,
         secret_key=args.secret_key,
         secure=not args.insecure,
+        bucket_name=args.bucket,
     )
     print(f"Uploaded {n} files to MinIO")
 

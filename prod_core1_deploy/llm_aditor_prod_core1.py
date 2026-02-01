@@ -254,9 +254,12 @@ async def analyze_repository(
     llm_client: LLMClient,
     trace_saver: TraceSaver,
     enable_js: bool = False,
+    status_callback: Optional[callable] = None,
 ):
     repo_path = repo_path.resolve()
     logger.info("Analyzing repository: %s", repo_path.name)
+    if status_callback:
+        status_callback(f"Analyzing repository: {repo_path.name}")
 
     graph = SecurityGraph(repo_path=repo_path)
     files_map: Dict[str, List[Path]] = defaultdict(list)
@@ -273,6 +276,8 @@ async def analyze_repository(
     all_raw_edges: List[Tuple[Edge, str]] = []
     for lang, paths in files_map.items():
         logger.info("Parsing %d %s files...", len(paths), lang)
+        if status_callback:
+            status_callback(f"Analyzing {len(paths)} {lang} files")
         parser_eng = CodeParser(lang, repo_root=repo_path)
         for p in paths:
             try:
@@ -286,6 +291,8 @@ async def analyze_repository(
                 logger.debug("Failed parsing %s: %s", p, e)
 
     logger.info("Linking %d calls...", len(all_raw_edges))
+    if status_callback:
+        status_callback(f"Linking {len(all_raw_edges)} calls")
     for e, lang in all_raw_edges:
         graph.add_edge(e.src, e.dst, lang, e.file, e.line)
 
@@ -297,6 +304,8 @@ async def analyze_repository(
 
     trace_ids = graph.trace_processor.get_all_trace_ids()
     logger.info("Found %d traces, analyzing with LLM (async)...", len(trace_ids))
+    if status_callback:
+        status_callback(f"Check {len(trace_ids)} potential vulns")
     save_no_vuln = config.get("save_no_vuln_traces", False)
 
     async def analyze_one(tid):
@@ -414,7 +423,7 @@ async def async_main():
         repo_name = repo_path.name
         trace_saver = TraceSaver(reports_dir, repo_name)
         try:
-            await analyze_repository(repo_path, config, llm_client, trace_saver, config.get("enable_js", False))
+            await analyze_repository(repo_path, config, llm_client, trace_saver, config.get("enable_js", False), status_callback=status_callback)
         except Exception as e:
             logger.error("Error analyzing %s: %s", repo_name, e, exc_info=True)
         if do_minio:
